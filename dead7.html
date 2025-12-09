@@ -104,6 +104,7 @@
         let activeTab = 'overview';
         let compMetadata = {};
         let loadingMetadata = false;
+        let metadataFetchInProgress = false; // Add a flag to prevent re-triggering fetchCompDetails
 
         // Simple state update and re-render function
         const setState = (newState) => {
@@ -114,7 +115,7 @@
         // Initialize state object on window
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
-            selectedYear, activeTab, compMetadata, loadingMetadata 
+            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress
         };
 
         // --- UTILITY FUNCTIONS ---
@@ -173,7 +174,11 @@
 
             const yearsMap = new Map();
 
-            Object.entries(data.results).forEach(([compId, eventsData]) => {
+            // Sort competition IDs by date (WCA ID usually includes year and month, but we rely on year here)
+            const sortedCompIds = Object.keys(data.results).sort((a, b) => a.localeCompare(b));
+
+            sortedCompIds.forEach((compId) => {
+                const eventsData = data.results[compId];
                 const year = extractYearFromId(compId);
                 
                 if (!yearsMap.has(year)) {
@@ -234,28 +239,46 @@
         // --- DATA FETCHING ---
 
         const fetchCompDetails = async (compIds) => {
-            const { compMetadata } = window.state;
+            const { compMetadata, metadataFetchInProgress } = window.state;
+            
+            // Critical check to prevent re-entry
+            if (metadataFetchInProgress) return; 
+
             const missingIds = compIds.filter(id => !compMetadata[id]);
             if (missingIds.length === 0) return;
 
-            setState({ loadingMetadata: true });
+            setState({ loadingMetadata: true, metadataFetchInProgress: true });
             
             const chunkSize = 5;
             for (let i = 0; i < missingIds.length; i += chunkSize) {
                 const chunk = missingIds.slice(i, i + chunkSize);
+                // Use Promise.all with `setState` inside the loop (which is outside the fetch logic)
+                // This ensures we batch updates and don't flood the render cycle.
                 await Promise.all(chunk.map(async (id) => {
                     try {
-                        const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/competitions/${id}.json`);
-                        if (res.ok) {
+                        // Simple retry logic (max 2 retries)
+                        let res;
+                        for (let attempt = 0; attempt < 2; attempt++) {
+                            res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/competitions/${id}.json`);
+                            if (res.ok) break;
+                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1))); // Wait 500ms, 1000ms
+                        }
+                        
+                        if (res && res.ok) {
                             const data = await res.json();
-                            setState({ compMetadata: { ...window.state.compMetadata, [id]: data } });
+                            // Update metadata in the batch update below
+                            compMetadata[id] = data;
                         }
                     } catch (e) {
                         console.warn(`Failed to fetch metadata for ${id}`, e);
                     }
                 }));
+                // Batch update the state after processing a chunk
+                setState({ compMetadata: { ...compMetadata } });
             }
-            setState({ loadingMetadata: false });
+            
+            // Final state update
+            setState({ loadingMetadata: false, metadataFetchInProgress: false });
         };
 
         const fetchData = async (id) => {
@@ -293,6 +316,21 @@
         };
 
         // --- STATS CALCULATION ---
+        
+        const calculateYearMedals = (comps) => {
+            let medals = { gold: 0, silver: 0, bronze: 0 };
+            comps.forEach(comp => {
+                comp.results.forEach(res => {
+                    if (res.round === "Final" && res.place <= 3 && res.best > 0) {
+                        if (res.place === 1) medals.gold++;
+                        else if (res.place === 2) medals.silver++;
+                        else if (res.place === 3) medals.bronze++;
+                    }
+                });
+            });
+            return medals;
+        };
+
 
         const calculateStats = (state) => {
             const { selectedYear, historyData, compMetadata, userData } = state;
@@ -304,11 +342,12 @@
                 ? historyData.flatMap(h => h.competitions)
                 : historyData.find(d => d.year === selectedYear)?.competitions || [];
             
-            // 2. Calculate Previous Year Data (Only if not All Time)
+            // 2. Calculate Previous Year Data for Trend Comparison (Only if not All Time)
             let prevStats = null;
             if (!isAllTime) {
                 const prevYear = selectedYear - 1;
                 const prevYearEntry = historyData.find(d => d.year === prevYear);
+                
                 if (prevYearEntry) {
                      let pComps = prevYearEntry.competitions;
                      let pCountries = new Set();
@@ -322,18 +361,24 @@
                          const meta = compMetadata[c.id];
                          if (meta) {
                              pCountries.add(meta.country);
-                             if (meta.country !== userData?.country) pOverseas++;
+                             // Check for country difference safely
+                             if (userData && userData.country && meta.country !== userData.country) pOverseas++;
                          }
                      });
+                     
+                     const prevYearMedals = calculateYearMedals(pComps);
+
                      prevStats = {
                          comps: pComps.length,
                          solves: pSolves,
                          countries: pCountries.size,
                          overseas: pOverseas,
-                         events: prevYearEntry.competitions.flatMap(c => c.events).filter((v, i, a) => a.indexOf(v) === i).length
+                         events: prevYearEntry.competitions.flatMap(c => c.events).filter((v, i, a) => a.indexOf(v) === i).length,
+                         medals: prevYearMedals
                      };
                 }
             }
+
 
             let totalComps = relevantComps.length;
             let totalSolves = 0;
@@ -356,24 +401,22 @@
                 }
             };
 
-            // 1. Build Historical PBs (Only needed if NOT All Time)
-            if (!isAllTime) {
-                 const allYearsAsc = [...historyData].sort((a,b) => a.year - b.year);
-                 for (const yData of allYearsAsc) {
-                     if (yData.year > selectedYear) break;
-                     
-                     yData.competitions.forEach(c => {
-                         c.results.forEach(r => {
-                             updateBest(pb.single, r.event, r.best, c.name);
-                             updateBest(pb.average, r.event, r.average, c.name);
-                         });
-                     });
-                 }
+            // 1. Build Historical PBs (PB calculation is complex - iterate all previous years up to the selected year)
+            const allYearsAsc = [...historyData].sort((a,b) => a.year - b.year);
+            for (const yData of allYearsAsc) {
+                if (!isAllTime && yData.year > selectedYear) break;
+                
+                yData.competitions.forEach(c => {
+                    c.results.forEach(r => {
+                        // Ensure we are only updating PB up to the selected date/year
+                        updateBest(pb.single, r.event, r.best, c.name);
+                        updateBest(pb.average, r.event, r.average, c.name);
+                    });
+                });
             }
-            // If All Time, PB = SB, calculated in step 2.
 
 
-            // 2. Iterate Selection for Stats & SB
+            // 2. Iterate Selection for Current Stats & SB
             relevantComps.forEach(comp => {
                 totalSolves += comp.solvesCount;
                 totalAttempts += comp.attemptsCount;
@@ -383,7 +426,7 @@
                 const meta = compMetadata[comp.id];
                 if (meta) {
                     uniqueCountries.add(meta.country);
-                    if (userData && meta.country !== userData.country) {
+                    if (userData && userData.country && meta.country !== userData.country) {
                         overseasCount++;
                     }
                 }
@@ -409,12 +452,6 @@
                     // Season Best / All Time Best (if AllTime)
                     updateBest(sb.single, res.event, res.best, comp.name);
                     updateBest(sb.average, res.event, res.average, comp.name);
-
-                    // If All Time, PB is same as SB calculation
-                    if (isAllTime) {
-                         updateBest(pb.single, res.event, res.best, comp.name);
-                         updateBest(pb.average, res.event, res.average, comp.name);
-                    }
                 });
             });
             
@@ -431,7 +468,28 @@
 
         // Trend Indicator HTML
         const TrendIndicator = (current, previous) => {
-            if (previous === undefined || previous === null || previous === 0) return `<span class="text-slate-500 ml-2 text-xs">-</span>`;
+            // Check for safe arithmetic (null, undefined, or NaN)
+            if (previous === undefined || previous === null || current === null || isNaN(current) || isNaN(previous)) {
+                 return `<span class="text-slate-500 ml-2 text-xs">-</span>`;
+            }
+            
+            // Handle 0 to N case explicitly for positive trend
+            if (previous === 0 && current > 0) {
+                 return `<span class="text-green-400 ml-2 text-xs font-medium flex items-center">
+                            <i data-lucide="chevrons-up" class="w-3 h-3 mr-0.5"></i>
+                            ${current}
+                            <span class="opacity-70 ml-0.5">(New)</span>
+                        </span>`;
+            } else if (previous === 0 && current === 0) {
+                return `<span class="text-slate-500 ml-2 text-xs"><i data-lucide="minus" class="inline w-3 h-3"></i></span>`;
+            } else if (current === 0) {
+                 // N to 0 case (100% decrease)
+                 return `<span class="text-red-400 ml-2 text-xs font-medium flex items-center">
+                            <i data-lucide="arrow-down-right" class="w-3 h-3 mr-0.5"></i>
+                            ${previous}
+                            <span class="opacity-70 ml-0.5">(-100%)</span>
+                        </span>`;
+            }
             
             const diff = current - previous;
             if (diff === 0) return `<span class="text-slate-500 ml-2 text-xs"><i data-lucide="minus" class="inline w-3 h-3"></i></span>`;
@@ -470,14 +528,15 @@
 
         // Competition Item HTML
         const CompetitionItem = (comp) => {
-            const metadata = window.state.compMetadata[comp.id];
-            const compName = metadata?.name || comp.name;
+            // Safely access metadata
+            const metadata = window.state.compMetadata[comp.id] || null;
+            const compName = metadata?.name || comp.id;
             const link = `https://www.worldcubeassociation.org/competitions/${comp.id}`;
             
             const medalResults = comp.results
                 .filter(r => r.place <= 3 && r.round === "Final" && r.best > 0);
             
-            const medalHtml = medalResults.map((res, idx) => {
+            const medalHtml = medalResults.map((res) => {
                 const eventInfo = getEventInfo(res.event);
                 const placeClass = res.place === 1 ? 'border-yellow-500/30' : res.place === 2 ? 'border-gray-400/30' : 'border-amber-700/30';
                 const iconHtml = res.place === 1 
@@ -549,9 +608,9 @@
                                 <div class="w-2 h-2 rounded-full ${eventInfo.bg}"></div>
                                 ${eventInfo.name}
                             </td>
-                            <td class="px-4 py-3 text-center font-bold text-slate-300">${stats.gold || "-"}</td>
-                            <td class="px-4 py-3 text-center font-bold text-slate-300">${stats.silver || "-"}</td>
-                            <td class="px-4 py-3 text-center font-bold text-slate-300">${stats.bronze || "-"}</td>
+                            <td class="px-4 py-3 text-center font-bold text-yellow-500">${stats.gold || "-"}</td>
+                            <td class="px-4 py-3 text-center font-bold text-gray-400">${stats.silver || "-"}</td>
+                            <td class="px-4 py-3 text-center font-bold text-amber-700">${stats.bronze || "-"}</td>
                             <td class="px-4 py-3 text-right font-bold text-white">${stats.total}</td>
                         </tr>
                     `;
@@ -578,7 +637,7 @@
         };
         
         // Records Table Helper
-        const RecordTable = (records, title, isAllTime, type, comparisonRecords = {}) => {
+        const RecordTable = (records, title, isAllTime, type, historicalPB = {}) => {
             // Get all unique events from the records (SB or PB) and sort them
             const events = Object.keys(records.single);
             const sortedEvents = events.sort((a, b) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b));
@@ -586,28 +645,26 @@
             const rows = sortedEvents.map((event) => {
                 const recordSingle = records.single[event];
                 const recordAvg = records.average[event];
-                const eventInfo = getEventInfo(event);
                 
-                let comparisonSingle = null;
-                let comparisonAvg = null;
+                // Historical bests (used for comparison if showing SB)
+                const historicalPBSingle = historicalPB.single?.[event]?.value || null;
+                const historicalPBAvg = historicalPB.average?.[event]?.value || null;
 
-                if (type === 'sb' && !isAllTime && comparisonRecords.single) {
-                    // When showing Season Best, compare to the all-time PB (if SB is better, it's a new PB)
-                    comparisonSingle = comparisonRecords.single[event]?.value || null;
-                    comparisonAvg = comparisonRecords.average[event]?.value || null;
-                }
+                // Determine if SB is better than historical PB
+                const isNewPBSingle = !isAllTime && historicalPBSingle !== null && recordSingle.value < historicalPBSingle;
+                const isNewPBAvg = !isAllTime && historicalPBAvg !== null && recordAvg.value < historicalPBAvg;
 
 
                 return `
                     <tr class="hover:bg-slate-800/50 transition-colors">
                         <td class="px-6 py-4 font-medium text-white flex items-center gap-2">
-                            ${eventInfo.name}
+                            ${getEventInfo(event).name}
                         </td>
                         
                         <td class="px-6 py-4 border-r border-slate-800/50">
                             <div class="font-mono text-indigo-300 font-bold">
                                 ${recordSingle ? formatResult(recordSingle.value, event, 'single') : "-"}
-                                ${comparisonSingle && recordSingle.value < comparisonSingle ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
+                                ${isNewPBSingle ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
                             </div>
                             <div class="text-xs text-slate-500 truncate max-w-[120px]">${recordSingle?.comp || ""}</div>
                         </td>
@@ -615,7 +672,7 @@
                         <td class="px-6 py-4">
                             <div class="font-mono text-white font-bold">
                                 ${recordAvg ? formatResult(recordAvg.value, event, 'average') : "-"}
-                                ${comparisonAvg && recordAvg.value < comparisonAvg ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
+                                ${isNewPBAvg ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
                             </div>
                             <div class="text-xs text-slate-500 truncate max-w-[120px]">${recordAvg?.comp || ""}</div>
                         </td>
@@ -637,7 +694,7 @@
                 <div class="mb-10">
                     <h4 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                         ${title}
-                        ${type === 'sb' && !isAllTime ? '<span class="text-xs text-indigo-300 ml-2">(Compare to All-Time PB)</span>' : ''}
+                        ${type === 'sb' && !isAllTime ? '<span class="text-xs text-indigo-300 ml-2">(<i data-lucide="award" class="w-3 h-3 text-yellow-400 inline-block mr-1"></i> indicates a new All-Time PB)</span>' : ''}
                     </h4>
                     <div class="overflow-x-auto rounded-xl border border-slate-800">
                         <table class="w-full text-left bg-slate-900">
@@ -662,17 +719,22 @@
             const { userData, loading, error, historyData, selectedYear, activeTab, compMetadata, loadingMetadata } = window.state;
             const stats = calculateStats(window.state);
             
-            // Re-fetch metadata if necessary when the relevant comps change (e.g. year selection changes)
-            if (!loading && !error) {
+            // Logic to trigger metadata fetch ONLY if needed and not already in progress
+            if (!loading && !error && !window.state.metadataFetchInProgress) {
                 const relevantComps = selectedYear === 'All Time'
                     ? historyData.flatMap(h => h.competitions)
                     : historyData.find(d => d.year === selectedYear)?.competitions || [];
                 
                 if (relevantComps.length > 0) {
                     const ids = relevantComps.map(c => c.id);
+                    // Pass the list of IDs needed for the current selection
                     fetchCompDetails(ids);
                 }
             }
+            
+            // Safe access for medal trends
+            const currentTotalMedals = stats.medals.gold + stats.medals.silver + stats.medals.bronze;
+            const prevTotalMedals = stats.prevStats?.medals ? stats.prevStats.medals.gold + stats.prevStats.medals.silver + stats.prevStats.medals.bronze : null;
 
 
             const appHtml = `
@@ -817,9 +879,9 @@
                             })}
                             ${StatCard({ 
                                 title: "Total Medals", 
-                                value: stats.medals.gold + stats.medals.silver + stats.medals.bronze, 
+                                value: currentTotalMedals, 
                                 subtext: `${stats.medals.gold} G, ${stats.medals.silver} S, ${stats.medals.bronze} B`,
-                                trendHtml: TrendIndicator(stats.medals.gold + stats.medals.silver + stats.medals.bronze, stats.prevStats ? stats.prevStats.medals?.gold + stats.prevStats.medals?.silver + stats.prevStats.medals?.bronze : null), // Note: Prev medal stats not calculated efficiently in JS, may show '-'
+                                trendHtml: TrendIndicator(currentTotalMedals, prevTotalMedals),
                                 icon: "trophy", 
                                 colorClass: "text-yellow-400 bg-yellow-400/10" 
                             })}
@@ -865,7 +927,12 @@
                                     </div>
                                     
                                     <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
-                                        ${relevantComps.map(comp => CompetitionItem(comp)).join('')}
+                                        ${relevantComps.length > 0 ? relevantComps.map(comp => CompetitionItem(comp)).join('') : `
+                                            <div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed">
+                                                <i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>
+                                                No competitions found in this year.
+                                            </div>
+                                        `}
                                     </div>
                                 </div>
                             ` : activeTab === 'records' ? `
@@ -883,7 +950,7 @@
                                         ${RecordTable(stats.pb, "All-Time Personal Bests (PBs)", true, 'pb')}
                                     ` : `
                                         ${RecordTable(stats.sb, `Season Bests in ${selectedYear} (SB)`, false, 'sb', stats.pb)}
-                                        ${RecordTable(stats.pb, "All-Time Personal Bests (PBs) achieved up to this date", false, 'pb')}
+                                        ${RecordTable(stats.pb, "All-Time Personal Bests (PBs) Achieved Up To This Date", false, 'pb')}
                                     `}
                                     
                                 </div>
