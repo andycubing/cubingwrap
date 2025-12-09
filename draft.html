@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cuber WCA Career Summary</title>
+    <title>Cuber WCA Career Summaryy</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -671,7 +671,7 @@
                                 ${recordSingle ? formatResult(recordSingle.value, event, 'single') : "-"}
                                 ${isNewPBSingle ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
                             </div>
-                            <div class="text-xs text-slate-500 truncate max-w-[120px]">${recordSingle?.comp || ""}</div>
+                            <div class="text-xs text-slate-500 truncate max-w-[180px]">${recordSingle?.comp || ""}</div>
                         </td>
 
                         <td class="px-6 py-4">
@@ -679,7 +679,7 @@
                                 ${recordAvg ? formatResult(recordAvg.value, event, 'average') : "-"}
                                 ${isNewPBAvg ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 ml-1"></i>' : ''}
                             </div>
-                            <div class="text-xs text-slate-500 truncate max-w-[120px]">${recordAvg?.comp || ""}</div>
+                            <div class="text-xs text-slate-500 truncate max-w-[180px]">${recordAvg?.comp || ""}</div>
                         </td>
                     </tr>
                 `;
@@ -699,7 +699,6 @@
                 <div class="mb-10">
                     <h4 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                         ${title}
-                        ${type === 'sb' && !isAllTime ? '<span class="text-xs text-indigo-300 ml-2">(<i data-lucide="award" class="w-3 h-3 text-yellow-400 inline-block mr-1"></i> indicates a new All-Time PB)</span>' : ''}
                     </h4>
                     <div class="overflow-x-auto rounded-xl border border-slate-800">
                         <table class="w-full text-left bg-slate-900">
@@ -757,7 +756,7 @@
                                 <i data-lucide="cuboid" class="text-white w-5 h-5"></i>
                             </div>
                             <h1 class="text-xl font-bold hidden sm:block bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
-                                CuberWrapped
+                                CuberWCASummary
                             </h1>
                         </div>
 
@@ -891,7 +890,7 @@
                             ${StatCard({ 
                                 title: "Total Medals", 
                                 value: currentTotalMedals, 
-                                subtext: `${stats.medals.gold} G, ${stats.medals.silver} S, ${stats.medals.bronze} B`,
+                                subtext: `${stats.medals.gold} Gold, ${stats.medals.silver} Silver, ${stats.medals.bronze} Bronze`,
                                 trendHtml: TrendIndicator(currentTotalMedals, prevTotalMedals),
                                 icon: "trophy", 
                                 colorClass: "text-yellow-400 bg-yellow-400/10" 
@@ -966,10 +965,10 @@
                                             No competition data for this period.
                                         </div>
                                     ` : selectedYear === 'All Time' ? `
-                                        ${RecordTable(stats.pb, "All-Time Personal Bests (PBs)", true, 'pb')}
+                                        ${RecordTable(stats.pb, "All-Time Personal Records (PRs)", true, 'pb')}
                                     ` : `
-                                        ${RecordTable(stats.sb, `Season Bests in ${selectedYear} (SB)`, false, 'sb', stats.pb)}
-                                        ${RecordTable(stats.pb, "All-Time Personal Bests (PBs) Achieved Up To This Date", false, 'pb')}
+                                        ${RecordTable(stats.sb, `Best Results in ${selectedYear}`, false, 'sb', stats.pb)}
+                                        ${RecordTable(stats.pb, `All-Time Personal Records (PRs) Up To ${selectedYear}`, false, 'pb')}
                                     `}
                                     
                                 </div>
