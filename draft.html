@@ -206,7 +206,8 @@
                         // Calculate Solves/Attempts
                         if (roundData.solves) {
                             roundData.solves.forEach(s => {
-                                if (s >= -1) attemptsCount++;
+                                if (s > 0) attemptsCount++;
+                                if (s === -1) attemptsCount++;
                                 if (s > 0) solvesCount++;
                             });
                         }
@@ -764,10 +765,10 @@
                             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 w-4 h-4"></i>
                             <input 
                                 type="text" 
+                                id="wcaSearchInput"
                                 placeholder="Enter WCA ID (e.g., 2017KWAN05)"
                                 class="w-full bg-slate-900 border border-slate-700 rounded-full py-2 pl-10 pr-4 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all"
                                 value="${window.state.inputWcaId}"
-                                oninput="setState({ inputWcaId: this.value })"
                             />
                         </form>
                     </div>
@@ -937,7 +938,15 @@
                                     </div>
                                     
                                     <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
-                                        ${relevantComps.length > 0 ? relevantComps.map(comp => CompetitionItem(comp)).join('') : `
+                                        ${relevantComps.length > 0 ? relevantComps
+                                        // Sort competitions: newest first using real date from metadata
+                                          .sort((a, b) => {
+                                              const dateA = window.state.compMetadata[a.id]?.date?.from || a.id;
+                                              const dateB = window.state.compMetadata[b.id]?.date?.from || b.id;
+                                              return dateB.localeCompare(dateA); // Newest date first
+                                          })
+                                          .map(comp => CompetitionItem(comp)).join('') 
+                                        : `
                                             <div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed">
                                                 <i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>
                                                 No competitions found in this year.
@@ -987,6 +996,21 @@
             // Load initial data
             fetchData(window.state.wcaId);
         });
+        
+        document.addEventListener('input', e => {
+    if (e.target.id === 'wcaSearchInput') {
+        e.target.value = e.target.value.toUpperCase();
+        window.state.inputWcaId = e.target.value;
+    }
+});
+
+function doSearch() {
+    const id = document.getElementById('wcaSearchInput').value.trim().toUpperCase();
+    if (id && id !== window.state.wcaId) {
+        setState({ wcaId: id, inputWcaId: id });
+        fetchData(id);
+    }
+}
 
     </script>
 </body>
