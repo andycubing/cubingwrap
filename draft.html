@@ -381,7 +381,7 @@
                   let improved = false;
                   const entries = [];
       
-                  if (res.best > 0 && res.best < currentBest[eventId].single) {
+                  if (res.best > 0 && res.best <= currentBest[eventId].single) {
                       currentBest[eventId].single = res.best;
                       improved = true;
                       entries.push({
@@ -391,7 +391,7 @@
                       });
                   }
       
-                  if (eventId !== '333mbf' && res.average > 0 && res.average < currentBest[eventId].average) {
+                  if (eventId !== '333mbf' && res.average > 0 && res.average <= currentBest[eventId].average) {
                       currentBest[eventId].average = res.average;
                       improved = true;
                       const details = res.solves ? '(' + res.solves
@@ -700,8 +700,8 @@
                 const historicalPBSingle = historicalPB.single?.[event]?.value || null;
                 const historicalPBAvg = historicalPB.average?.[event]?.value || null;
 
-                const isNewPBSingle = !isAllTime && historicalPBSingle !== null && recordSingle && recordSingle.value < historicalPBSingle;
-                const isNewPBAvg = !isAllTime && historicalPBAvg !== null && recordAvg && recordAvg.value < historicalPBAvg;
+                const isNewPBSingle = !isAllTime && historicalPBSingle !== null && recordSingle && recordSingle.value <= historicalPBSingle;
+                const isNewPBAvg = !isAllTime && historicalPBAvg !== null && recordAvg && recordAvg.value <= historicalPBAvg;
 
 
                 return `
@@ -770,7 +770,7 @@
                     const e = getEventInfo(event);
                     return `
                         <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-3 cursor-pointer hover:border-indigo-500 transition"
-                             onclick="document.getElementById('record-timeline').scrollIntoView({behavior:'smooth'})">
+                             onclick="document.getElementById('event-${event}').scrollIntoView({behavior:'smooth', block:'center'})">
                             <div class="p-2 rounded-full ${e.bg}">
                                 <i data-lucide="cuboid" class="w-5 h-5"></i>
                             </div>
@@ -785,7 +785,8 @@
         
             return `
                 <div class="mb-12">
-                
+                    
+        
                     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
                         ${items}
                     </div>
@@ -793,63 +794,65 @@
         };
         
         const TimelineView = (timeline) => {
-             if (Object.keys(timeline).length === 0) return `<div class="p-10 text-center text-slate-500">No data available.</div>`;
-
-             const sections = Object.keys(timeline)
+            if (Object.keys(timeline).length === 0) {
+                return `<div class="text-center py-20 text-slate-500">No record history in this period.</div>`;
+            }
+        
+            const sections = Object.keys(timeline)
                 .sort((a, b) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b))
                 .map(event => {
-                    const eventInfo = getEventInfo(event);
-                    const records = timeline[event].reverse(); // Newest first for display
-                    
+                    const i = getEventInfo(event);
+                    const records = [...timeline[event]].reverse(); // newest first
+        
                     const rows = records.map(rec => `
-                        <tr class="hover:bg-slate-800/50 transition-colors border-l-2 ${rec.type === 'Average' ? 'border-indigo-500' : 'border-emerald-500'}">
-                             <td class="px-4 py-3 text-slate-300 text-xs">${rec.date}</td>
-                             <td class="px-4 py-3 text-white font-medium">
+                        <tr class="hover:bg-slate-800/50 border-l-2 ${rec.type === 'Average' ? 'border-indigo-500' : 'border-emerald-500'}">
+                            <td class="px-6 py-4 text-sm text-slate-300 w-32">${rec.date || '—'}</td>
+                            <td class="px-6 py-4 text-white font-medium max-w-xs truncate">
                                 ${rec.compName}
-                                <div class="text-xs text-slate-500 font-normal">${rec.round}</div>
-                             </td>
-                             <td class="px-4 py-3">
-                                <span class="px-2 py-0.5 rounded text-xs font-bold ${rec.type === 'Average' ? 'bg-indigo-900/50 text-indigo-300' : 'bg-emerald-900/50 text-emerald-300'}">
+                                <div class="text-xs text-slate-500 mt-1">${rec.round}</div>
+                            </td>
+                            <td class="px-6 py-4 w-28 text-center">
+                                <span class="px-3 py-1 rounded text-xs font-bold ${rec.type === 'Average' ? 'bg-indigo-900/60 text-indigo-300' : 'bg-emerald-900/60 text-emerald-300'}">
                                     ${rec.type}
                                 </span>
-                             </td>
-                             <td class="px-4 py-3 font-mono font-bold text-white">
+                            </td>
+                            <td class="px-6 py-4 font-mono font-bold text-white text-center w-40">
                                 ${rec.formattedResult}
-                                ${rec.details ? `<div class="text-xs text-slate-500 font-normal mt-0.5">${rec.details}</div>` : ''}
-                             </td>
-                        </tr>
-                    `).join('');
-
+                                ${rec.isTied ? '<span class="ml-2 text-amber-400 text-xs text-center">=PB</span>' : ''}
+                                ${rec.details ? `<div class="text-xs text-slate-500 mt-1 font-normal text-center">${rec.details}</div>` : ''}
+                            </td>
+                        </tr>`).join('');
+        
                     return `
-                        <div class="mb-8 break-inside-avoid">
-                            <h4 class="text-md font-bold text-white mb-3 flex items-center gap-2 border-b border-slate-800 pb-2">
-                                <div class="w-2 h-2 rounded-full ${eventInfo.bg}"></div>
-                                ${eventInfo.name}
+                        <div id="event-${event}" class="w-full max-w-5xl mx-auto mb-16 last:mb-0">
+                            <h4 class="text-xl font-bold text-white mb-6 flex items-center gap-3 border-b border-slate-700 pb-4">
+                                <div class="w-4 h-4 rounded-full ${i.bg}"></div>
+                                ${i.name}
+                                <span class="text-slate-400 text-sm font-normal">(${records.length} record${records.length > 1 ? 's' : ''})</span>
                             </h4>
-                            <div class="overflow-x-auto rounded-lg border border-slate-800">
-                                <table class="w-full text-left bg-slate-900">
-                                    <thead class="bg-slate-950 text-slate-400 text-xs uppercase font-semibold">
+        
+                            <div class="w-full overflow-x-auto rounded-xl border border-slate-800">
+                                <table class="w-full table-fixed">
+                                    <thead class="bg-slate-950 text-slate-400 text-xs uppercase tracking-wider">
                                         <tr>
-                                            <th class="px-4 py-2 w-24">Date</th>
-                                            <th class="px-4 py-2">Competition</th>
-                                            <th class="px-4 py-2 w-20">Type</th>
-                                            <th class="px-4 py-2">Result</th>
+                                            <th class="px-6 py-4 text-left w-40 text-center">Date</th>
+                                            <th class="px-6 py-4 text-left text-center">Competition</th>
+                                            <th class="px-6 py-4 text-left w-28 text-center">Type</th>
+                                            <th class="px-6 py-4 text-left w-100 text-center">Result</th>
                                         </tr>
                                     </thead>
-                                    <tbody class="divide-y divide-slate-800 text-sm">
+                                    <tbody class="divide-y divide-slate-800">
                                         ${rows}
                                     </tbody>
                                 </table>
                             </div>
-                        </div>
-                    `;
+                        </div>`;
                 }).join('');
-            
+        
             return `
-                <div class="columns-1 lg:columns-2 gap-6 space-y-6">
+                <div id="record-timeline" class="w-full mt-8">
                     ${sections}
-                </div>
-            `;
+                </div>`;
         };
 
         // --- MAIN RENDER FUNCTION ---
@@ -1108,8 +1111,8 @@
                                     </h3>
                                     ${SolveCountTable(stats.solveCounts, stats.totalSolves, stats.totalAttempts)}
                                     
-                                    <h3 id="record-timeline" class="text-2xl font-bold text-white mb-8 flex items-center gap-2">
-                                        <i data-lucide="trending-up" class="text-emerald-400 w-6 h-6"></i>
+                                    <h3 id="record-timeline" class="text-2xl font-bold text-white my-12 flex items-center gap-3">
+                                        <i data-lucide="trending-up" class="text-emerald-400 w-7 h-7"></i>
                                         Record Timeline
                                     </h3>
                                     ${TimelineView(stats.timeline)}
