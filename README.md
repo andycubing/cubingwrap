@@ -1,1 +1,2 @@
-# cubingwrap
+# Cuber WCA Summary
+# Nerd
