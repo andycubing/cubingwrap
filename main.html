@@ -42,7 +42,6 @@
 </head>
 <body class="min-h-screen bg-slate-900 text-slate-200">
 
-    <!-- Icon Library (Lucide) -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
     <script>
         // Initialize Lucide icons
@@ -50,10 +49,8 @@
         window.addEventListener('load', updateIcons);
     </script>
     
-    <!-- Main App Container -->
     <div id="app">
-        <!-- Content will be rendered here by JavaScript -->
-    </div>
+        </div>
 
     <script>
         // --- DATA & CONFIG ---
@@ -102,7 +99,7 @@
             "Combined Final": 4};
         const getRoundPriority = (roundName) => ROUND_ORDER[roundName] || 99;      
         
-        // --- STATE MANAGEMENT ---
+        // --- STATE MANAGEMENT (UPDATED) ---
         let wcaId = WCA_ID_DEFAULT;
         let inputWcaId = WCA_ID_DEFAULT;
         let userData = null;
@@ -112,13 +109,19 @@
         let selectedYear = 'All Time';
         let activeTab = 'overview';
         let compMetadata = {};
+        let compResults = {}; // NEW: To store full competition results for analysis
         let loadingMetadata = false;
+        let loadingResults = false; // NEW
         let metadataFetchInProgress = false; 
         let selectedEvent = null; 
-
+        let closestCubers = []; // NEW: List of closest cubers
+        let cuberNames = {}; // NEW: Cache { personId: name }
+        let loadingCuberNames = false; // NEW: Flag to prevent multiple fetches
+  
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
-            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent
+            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
+            compResults, loadingResults, closestCubers, cuberNames, loadingCuberNames // ← ADD these
         };
 
         let chartInstance = null; 
@@ -220,7 +223,124 @@
             return Array.from(yearsMap.values()).sort((a, b) => b.year - a.year);
         };
         
-        // --- DATA FETCHING ---
+        // --- DATA FETCHING (NEW FOR CLOSEST CUBERS) ---
+
+        const fetchCompFullResults = async (compIds) => {
+            const { compResults } = window.state;
+            const missingIds = compIds.filter(id => compResults[id] === undefined || compResults[id].error);
+            if (missingIds.length === 0) return;
+
+            window.setState({ loadingResults: true });
+            
+            const newResults = { ...compResults };
+            const chunkSize = 5;
+            for (let i = 0; i < missingIds.length; i += chunkSize) {
+                const chunk = missingIds.slice(i, i + chunkSize);
+                await Promise.all(chunk.map(async (id) => {
+                    try {
+                        // Using the WCA REST API link pattern
+                        let res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/results/${id}.json`);
+                        if (res.ok) {
+                            const data = await res.json();
+                            newResults[id] = data.items;
+                        } else {
+                            newResults[id] = { error: true };
+                        }
+                    } catch (e) {
+                        newResults[id] = { error: true };
+                    }
+                }));
+            }
+
+            window.setState({ compResults: newResults, loadingResults: false });
+            calculateClosestCubers(window.state); // Recalculate after fetch
+        };
+        const fetchCuberNames = async (personIds) => {
+            const { cuberNames, loadingCuberNames } = window.state;
+            if (loadingCuberNames) return;
+            const missingIds = personIds.filter(id => !cuberNames[id]);
+            if (missingIds.length === 0) return;
+        
+            window.setState({ loadingCuberNames: true });
+        
+            const newNames = { ...cuberNames };
+            const chunkSize = 5;
+            for (let i = 0; i < missingIds.length; i += chunkSize) {
+                const chunk = missingIds.slice(i, i + chunkSize);
+                await Promise.all(chunk.map(async (id) => {
+                    try {
+                        const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/persons/${id}.json`);
+                        if (res.ok) {
+                            const data = await res.json();
+                            newNames[id] = data.name || id;
+                        } else {
+                            newNames[id] = id;
+                        }
+                    } catch (e) {
+                        newNames[id] = id;
+                    }
+                }));
+            }
+        
+            window.setState({ cuberNames: newNames, loadingCuberNames: false });
+        };
+        const calculateClosestCubers = (state) => {
+            const { wcaId, compResults, historyData, selectedYear } = state;
+            const isAllTime = selectedYear === 'All Time';
+        
+            // Filter competitions by selected year (same logic as other stats)
+            let allComps = historyData
+                .filter(y => isAllTime || y.year === parseInt(selectedYear))
+                .flatMap(y => y.competitions);
+        
+            const allCompIds = allComps.map(c => c.id);
+        
+            const cuberCompCounts = {};
+        
+            allCompIds.forEach(compId => {
+                const results = compResults[compId];
+                if (results && !results.error) {
+                    const competitorIds = new Set(results.map(r => r.personId).filter(id => id !== wcaId));
+                    competitorIds.forEach(otherId => {
+                        cuberCompCounts[otherId] = (cuberCompCounts[otherId] || 0) + 1;
+                    });
+                }
+            });
+        
+            const sortedCubers = Object.entries(cuberCompCounts)
+                .map(([personId, count]) => ({ personId, count }))
+                .sort((a, b) => b.count - a.count)
+                .slice(0, 10);
+        
+            window.setState({ closestCubers: sortedCubers });
+        
+            // Fetch names for the new list
+            if (sortedCubers.length > 0) {
+                fetchCuberNames(sortedCubers.map(c => c.personId));
+            }
+        };
+        // Function to get shared competition names (requires compMetadata)
+        const getSharedComps = (personId, state) => {
+            const { wcaId, compResults, historyData, compMetadata } = state;
+            const allCompsAttended = historyData.flatMap(y => y.competitions).map(c => c.id);
+            const shared = [];
+
+            allCompsAttended.forEach(compId => {
+                const results = compResults[compId];
+                if (results && !results.error) {
+                    const competitorIds = new Set(results.map(r => r.personId));
+                    // Check if both the main user and the other person attended
+                    if (competitorIds.has(wcaId) && competitorIds.has(personId)) {
+                        const meta = compMetadata[compId];
+                        const name = meta?.name || compId;
+                        shared.push({ id: compId, name: name });
+                    }
+                }
+            });
+            return shared;
+        };
+        
+        // --- DATA FETCHING (EXISTING) ---
 
         const fetchCompDetails = async (compIds) => {
             const { compMetadata, metadataFetchInProgress } = window.state;
@@ -393,7 +513,8 @@
                 }
         
                 comp.results.forEach(res => {
-                    if (res.round === "Final" && res.place <= 3 && res.best > 0) {
+                    // Only count medals for Final rounds, as this is the standard WCA definition
+                    if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                         if (res.place === 1) medals.gold++; 
                         else if (res.place === 2) medals.silver++; 
                         else if (res.place === 3) medals.bronze++; 
@@ -420,13 +541,10 @@
             let prevStats = null;
             if (!isAllTime) {
                 const prevYear = (parseInt(selectedYear) - 1).toString();
-                // Only calculate if we have data or if it's a valid year logic. 
-                // We'll calculate it regardless, if no data found it returns 0s which is correct.
                 prevStats = getStatsForYear(prevYear, historyData, compMetadata, userData);
             }
 
             // 3. Detailed breakdows (Medals, PBs) require specific object structures
-            // Re-using logic for detailed medals and PBs as they need the specific arrays
             const statsComps = isAllTime 
                 ? historyData.flatMap(y => y.competitions) 
                 : historyData.filter(y => y.year === parseInt(selectedYear)).flatMap(y => y.competitions);
@@ -455,7 +573,8 @@
             // SB and Detailed Medals
             statsComps.forEach(comp => {
                 comp.results.forEach(res => {
-                    if (res.round === "Final" && res.place <= 3 && res.best > 0) {
+                    // Only count medals for Final rounds (WCA medal definition)
+                    if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                         if (!medalStats[res.event]) medalStats[res.event] = { gold: 0, silver: 0, bronze: 0, total: 0 };
                         if (res.place === 1) medalStats[res.event].gold++;
                         else if (res.place === 2) medalStats[res.event].silver++;
@@ -500,7 +619,6 @@
             if (chartInstance) chartInstance.destroy();
 
             // 1. Sort competitions by Date ASCENDING (Oldest first)
-            // We need metadata for dates. If missing, fallback to ID.
             const sortedComps = [...comps].sort((a, b) => {
                 const dateA = window.state.compMetadata[a.id]?.date?.from || a.id;
                 const dateB = window.state.compMetadata[b.id]?.date?.from || b.id;
@@ -531,6 +649,7 @@
             });
 
             if (dataPoints.length === 0) return;
+            
             // 2. Trendline (Linear Regression)
             const n = dataPoints.length;
             let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
@@ -561,12 +680,9 @@
             });
 
             // 4. Calculate Scale Max (Outlier Filtering)
-            // Get all values, sort them
             const sortedValues = dataPoints.map(p => p.y).sort((a, b) => a - b);
-            // 95th Percentile
             const p95Index = Math.floor(sortedValues.length * 0.95);
             const p95Value = sortedValues[p95Index];
-            // Add a little buffer
             const suggestedMax = p95Value * 1.1;
 
             const labels = dataPoints.map((_, i) => i + 1);
@@ -686,18 +802,61 @@
                 </div>
             </div>`;
 
+        // --- COMPETITION ITEM (UPDATED FOR ALL ROUNDS + PODIUM HIGHLIGHTING) ---
         const CompetitionItem = (comp) => {
             const metadata = window.state.compMetadata[comp.id] || null;
             const compName = metadata?.name || comp.id;
             const link = `https://www.worldcubeassociation.org/competitions/${comp.id}`;
-            const medalResults = comp.results.filter(r => r.place <= 3 && r.round === "Final" && r.best > 0);
             
-            const medalHtml = medalResults.map((res) => {
-                const eventInfo = getEventInfo(res.event);
-                const placeClass = res.place === 1 ? 'border-yellow-500/30' : res.place === 2 ? 'border-gray-400/30' : 'border-amber-700/30';
-                const iconHtml = res.place === 1 ? '<i data-lucide="award" class="w-3 h-3 text-yellow-400 mr-1"></i>' : res.place === 2 ? '<i data-lucide="award" class="w-3 h-3 text-gray-400 mr-1"></i>' : '<i data-lucide="award" class="w-3 h-3 text-amber-700 mr-1"></i>';
-                return `<div class="text-xs p-2 rounded bg-slate-800/50 border ${placeClass} flex items-center justify-between"><span class="font-semibold text-slate-300">${eventInfo.name}</span><div class="flex items-center">${iconHtml}<span class="font-mono">${formatResult(res.average > 0 ? res.average : res.best, res.event, res.average > 0 ? 'average' : 'single')}</span></div></div>`;
-            }).join('');
+            // Group results by event and sort the rounds within the event
+            const eventsMap = new Map();
+            comp.results.forEach(res => {
+                if (!eventsMap.has(res.event)) {
+                    eventsMap.set(res.event, []);
+                }
+                eventsMap.get(res.event).push(res);
+            });
+
+            const eventResultsHtml = Array.from(eventsMap.entries())
+                .sort(([a], [b]) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b))
+                .map(([event, rounds]) => {
+                    const eventInfo = getEventInfo(event);
+                    rounds.sort((a, b) => getRoundPriority(a.round) - getRoundPriority(b.round));
+                    
+                    const roundHtml = rounds.map(res => {
+                        let placeClass = 'text-slate-400 border-slate-700/50';
+                        let iconHtml = '';
+                        
+                        // Valid podium is Top 3 AND the round is a Final round
+                        const isFinalRound = res.round.includes("Final"); 
+                        
+                        if (res.place === 1 && res.best > 0 && isFinalRound) {
+                            placeClass = 'text-yellow-400 bg-yellow-900/20 border-yellow-500/30 font-bold';
+                            iconHtml = '<i data-lucide="award" class="w-3 h-3 text-yellow-400 mr-1 shrink-0"></i>';
+                        } else if (res.place === 2 && res.best > 0 && isFinalRound) {
+                            placeClass = 'text-gray-400 bg-gray-700/20 border-gray-400/30 font-bold';
+                            iconHtml = '<i data-lucide="award" class="w-3 h-3 text-gray-400 mr-1 shrink-0"></i>';
+                        } else if (res.place === 3 && res.best > 0 && isFinalRound) {
+                            placeClass = 'text-amber-700 bg-amber-900/20 border-amber-700/30 font-bold';
+                            iconHtml = '<i data-lucide="award" class="w-3 h-3 text-amber-700 mr-1 shrink-0"></i>';
+                        }
+
+                        return `
+                            <div class="flex justify-between items-center text-xs py-1 px-2 rounded border ${placeClass}">
+                                <span class="font-medium flex items-center">${iconHtml}${res.round.replace("round", "Rd").replace("Combined ", "")}</span>
+                                <span class="font-mono text-white flex items-center gap-1">
+                                    <span class="text-xs ${res.place > 0 ? 'font-bold' : 'text-slate-500'}">${res.place > 0 ? '#' + res.place : '-'}</span>
+                                    ${formatResult(res.average > 0 ? res.average : res.best, res.event, res.average > 0 ? 'average' : 'single')}
+                                </span>
+                            </div>`;
+                    }).join('');
+
+                    return `
+                        <div class="p-3 bg-slate-800 rounded-lg border border-slate-700 shadow-inner">
+                            <h5 class="text-sm font-semibold text-white mb-2 flex items-center gap-2"><div class="w-2 h-2 rounded-full ${eventInfo.bg}"></div>${eventInfo.name}</h5>
+                            <div class="space-y-1">${roundHtml}</div>
+                        </div>`;
+                }).join('');
 
             return `
                 <div class="group relative border-l-2 border-slate-700 pl-6 pb-8 last:pb-0 hover:border-indigo-500 transition-colors">
@@ -709,9 +868,11 @@
                         </div>
                         <div class="mt-2 sm:mt-0 flex gap-2"><span class="text-xs font-mono bg-slate-800 px-2 py-1 rounded text-slate-300 border border-slate-700">${comp.events.length} Events</span><span class="text-xs font-mono bg-slate-800 px-2 py-1 rounded text-slate-300 border border-slate-700">${comp.solvesCount} Solves</span></div>
                     </div>
-                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">${medalHtml}</div>
+                    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 mt-3">${eventResultsHtml}</div>
                 </div>`;
         };
+        // --- END COMPETITION ITEM (UPDATED) ---
+
 
         const MedalTable = (medalStats) => {
             const rows = Object.entries(medalStats).sort(([a], [b]) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b)).filter(([, stats]) => stats.total > 0).map(([event, stats]) => {
@@ -819,9 +980,91 @@
             return `<div class="space-y-6">${sections}</div>`;
         };
 
-        // --- MAIN RENDER FUNCTION ---
+        // --- NEW CLOSEST CUBERS RENDERING ---
+        
+        const ClosestCuberTable = (cubers, loading) => {
+            const { loadingCuberNames } = window.state;
+        
+            if (loading || loadingCuberNames) {
+                return `<div class="flex flex-col items-center justify-center py-10 text-indigo-400"><i data-lucide="loader-2" class="animate-spin mb-4 w-8 h-8"></i><p>Analyzing competitions and fetching names...</p></div>`;
+            }
+        
+            if (cubers.length === 0) {
+                return `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="users" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No shared competitions found or no data loaded.</div>`;
+            }
+        
+            const rows = cubers.map((cuber) => {
+                const name = window.state.cuberNames[cuber.personId] || cuber.personId;
+                const isLoadingName = !window.state.cuberNames[cuber.personId];
+                return `
+                    <tr class="hover:bg-slate-800/50 transition-colors">
+                        <td class="px-6 py-4 font-medium">
+                            <button onclick="window.displaySharedComps('${cuber.personId}')" class="text-indigo-400 hover:text-indigo-300 hover:underline font-bold">
+                                ${name} ${isLoadingName ? '<i data-lucide="loader-2" class="animate-spin inline w-3 h-3 ml-1"></i>' : ''}
+                            </button>
+                            <div class="text-xs text-slate-500">(${cuber.personId})</div>
+                        </td>
+                        <td class="px-6 py-4 text-right font-mono text-white">${cuber.count}</td>
+                    </tr>
+                `;
+            }).join('');
+        
+            return `
+                <div class="mb-10">
+                    <h4 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                        <i data-lucide="user-plus" class="text-indigo-400 w-4 h-4"></i>Top Co-Competitors
+                    </h4>
+                    <div class="overflow-x-auto rounded-xl border border-slate-800">
+                        <table class="w-full text-left bg-slate-900">
+                            <thead class="bg-slate-950 text-slate-400 text-xs uppercase font-semibold">
+                                <tr>
+                                    <th class="px-6 py-4">Name</th>
+                                    <th class="px-6 py-4 text-right">Shared Comps</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800">${rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+                <div id="sharedCompsDetail" class="mt-8"></div>
+            `;
+        };
+
+        // Global function to display shared competitions on click
+        window.displaySharedComps = (personId) => {
+            const detailContainer = document.getElementById('sharedCompsDetail');
+            const sharedComps = getSharedComps(personId, window.state);
+            
+            const listHtml = sharedComps.map(comp => {
+                const meta = window.state.compMetadata[comp.id];
+                const date = meta?.date?.from || 'Unknown Date';
+                const link = `https://www.worldcubeassociation.org/competitions/${comp.id}`;
+                return `
+                    <a href="${link}" target="_blank" rel="noreferrer" class="block p-3 bg-slate-800/50 hover:bg-slate-800 rounded-lg border border-slate-700 transition-colors flex justify-between items-center">
+                        <div>
+                            <div class="font-medium text-white">${comp.name}</div>
+                            <div class="text-xs text-slate-400">${date}</div>
+                        </div>
+                        <i data-lucide="external-link" class="w-4 h-4 text-slate-500"></i>
+                    </a>
+                `;
+            }).join('');
+
+            detailContainer.innerHTML = `
+                <h4 class="text-lg font-semibold text-white mb-4 flex items-center gap-2"><i data-lucide="list-checks" class="text-emerald-400 w-4 h-4"></i>Shared Competitions with ${personId} (${sharedComps.length} Total)</h4>
+                <div class="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-2">
+                    ${sharedComps.length > 0 ? listHtml : `<p class="text-slate-500 text-center">No competition data could be retrieved.</p>`}
+                </div>
+            `;
+            updateIcons(); 
+            // Scroll to the detail section
+            detailContainer.scrollIntoView({ behavior: 'smooth' });
+        };
+
+
+        // --- MAIN RENDER FUNCTION (UPDATED) ---
         const renderApp = () => {
-            const { userData, loading, error, historyData, selectedYear, activeTab, compMetadata, loadingMetadata, selectedEvent } = window.state;
+            const { userData, loading, error, historyData, selectedYear, activeTab, compMetadata, loadingMetadata, selectedEvent, compResults, loadingResults, closestCubers } = window.state;
             const isAllTime = selectedYear === 'All Time';
             
             const stats = calculateStats(window.state);
@@ -834,11 +1077,23 @@
                 }
             }
             
+            // Trigger full results fetch when the "Closest Cuber" tab is active (NEW LOGIC)
+            if (activeTab === 'closest_cuber' && !loading && !error) {
+                const allCompIds = historyData.flatMap(y => y.competitions).map(c => c.id);
+                // Only fetch for competitions that the user attended AND we haven't successfully fetched the full results for yet
+                const compsToFetch = allCompIds.filter(id => compResults[id] === undefined || compResults[id].error);
+                if (compsToFetch.length > 0 && !loadingResults) {
+                    fetchCompFullResults(compsToFetch);
+                } else if (allCompIds.length > 0 && closestCubers.length === 0 && !loadingResults) {
+                    // All comp results loaded, calculate the cubers if not already calculated
+                    calculateClosestCubers(window.state);
+                }
+            }
+
             const currentTotalMedals = stats.medals.gold + stats.medals.silver + stats.medals.bronze;
             const prevTotalMedals = stats.prevStats?.medals ? (stats.prevStats.medals.gold + stats.prevStats.medals.silver + stats.prevStats.medals.bronze) : null;
 
             const appHtml = `
-                <!-- Navbar -->
                 <header class="bg-slate-950 border-b border-slate-800 sticky top-0 z-20">
                     <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
                         <div class="flex items-center gap-3 shrink-0">
@@ -857,13 +1112,11 @@
                     : error ? `<div class="flex flex-col items-center justify-center py-20 text-red-400"><i data-lucide="alert-circle" class="mb-4 w-12 h-12"></i><p class="text-lg font-bold">Error Loading Data</p><p class="text-sm opacity-80">${error}</p><p class="text-xs mt-4 text-slate-500">Check WCA ID.</p></div>` 
                     : !userData ? `<div class="text-center py-20 text-slate-500"><p>No data available. Use the search bar to load a WCA ID.</p></div>` 
                     : `
-                        <!-- Year Selector -->
                         <div class="flex overflow-x-auto pb-4 mb-6 gap-2 no-scrollbar border-b border-slate-800/50">
                             <button onclick="window.setState({ selectedYear: 'All Time', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === 'All Time' ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">All Time</button>
                             ${historyData.map(h => `<button onclick="window.setState({ selectedYear: '${h.year}', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === String(h.year) ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">${h.year}</button>`).join('')}
                         </div>
 
-                        <!-- Profile Header -->
                         <div class="flex flex-col md:flex-row items-center md:items-start gap-6 mb-10">
                             <img src="https://flagcdn.com/w160/${userData.country.toLowerCase()}.png" alt="${userData.country} Flag" class="w-20 h-20 rounded-full border-4 border-slate-800 shadow-xl bg-slate-700 object-cover" onerror="this.onerror=null; this.src='https://placehold.co/80x80/1f2937/6b7280?text=${userData.country}';" />
                             <div class="text-center md:text-left flex-1">
@@ -881,7 +1134,6 @@
                             </div>
                         </div>
 
-                        <!-- Stats Overview Grid -->
                         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
                             ${StatCard({ title: "Competitions", value: stats.totalComps, trendHtml: TrendIndicator(stats.totalComps, stats.prevStats?.totalComps), icon: "calendar", colorClass: "text-blue-400 bg-blue-400/10" })}
                             ${StatCard({ title: "Total Solves", value: stats.totalSolves, trendHtml: TrendIndicator(stats.totalSolves, stats.prevStats?.totalSolves), icon: "activity", colorClass: "text-emerald-400 bg-emerald-400/10" })}
@@ -889,23 +1141,21 @@
                             ${StatCard({ title: "Total Medals", value: currentTotalMedals, subtext: `${stats.medals.gold} Gold, ${stats.medals.silver} Silver, ${stats.medals.bronze} Bronze`, trendHtml: TrendIndicator(currentTotalMedals, prevTotalMedals), icon: "trophy", colorClass: "text-yellow-400 bg-yellow-400/10" })}
                         </div>
 
-                        <!-- Tab Navigation -->
                         <div class="border-b border-slate-800 mb-8">
-                            <nav class="flex space-x-8">
-                                ${['overview', 'competitions', 'records', 'solves'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab}</button>`).join('')}
+                            <nav class="flex overflow-x-auto space-x-8 pb-1 no-scrollbar">
+                                ${['overview', 'competitions', 'records', 'solves', 'closest_cuber'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab.replace('_', ' ')}</button>`).join('')}
                             </nav>
                         </div>
 
-                        <!-- Tab Content -->
                         <div class="animate-fade-in-up">
                             ${activeTab === 'overview' ? `
                                 <div>
-                                    <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-6"><i data-lucide="medal" class="text-indigo-400 w-5 h-5"></i> Medal Breakdown</h3>
+                                    <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-6"><i data-lucide="medal" class="text-indigo-400 w-5 h-5"></i> Medal Breakdown (Final Rounds)</h3>
                                     ${Object.keys(stats.medalStats).length > 0 ? MedalTable(stats.medalStats) : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="trophy" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No podiums found in this selection.</div>`}
                                 </div>
                             ` : activeTab === 'competitions' ? `
                                 <div class="space-y-6">
-                                    <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white">Competition Timeline</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
+                                    <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (All Rounds & Podiums)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
                                     <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
                                         ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp)).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
                                     </div>
@@ -917,7 +1167,7 @@
                                 </div>
                             ` : activeTab === 'solves' ? `
                                 <div>
-                                    <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="layers" class="text-indigo-400 w-6 h-6"></i> Solve Analysis</h3>
+                                    <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="layers" class="text-indigo-400 w-6 h-6"></i> Solve Analysis (Graph and Timeline)</h3>
                                     <p class="text-slate-400 text-sm mb-6">Click the event button to learn your progression!</p>
                                     ${SolveCountTable(stats.solveCounts, stats.attemptCounts)}
                                     
@@ -942,6 +1192,12 @@
                                     </h3>
                                     ${TimelineView(stats.timeline, selectedEvent)}
                                 </div>
+                            ` : activeTab === 'closest_cuber' ? `
+                                <div>
+                                    <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="users" class="text-indigo-400 w-6 h-6"></i> Closest Cubers</h3>
+                                    <p class="text-slate-400 text-sm mb-6">These are the cubers you have attended the most competitions with. The WCA IDs are clickable to show the list of shared competitions.</p>
+                                    ${ClosestCuberTable(closestCubers, loadingResults)}
+                                </div>
                             ` : ''}
                         </div>
                     `}
@@ -963,6 +1219,7 @@
 
         window.addEventListener('load', () => {
             renderApp(); 
+            // Note: Replace WCA_ID_DEFAULT with your actual ID to see your data
             fetchData(window.state.wcaId);
         });
         
@@ -974,6 +1231,5 @@
         });
 
     </script>
-    <script src="script.js"></script>
 </body>
 </html>
