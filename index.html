@@ -119,6 +119,8 @@
         };
 
         let chartInstance = null; 
+        // Store instances for stats charts
+        let statsChartInstances = {};
 
         window.setState = (newState) => {
             Object.assign(window.state, newState);
@@ -304,6 +306,7 @@
           const timeline = {};
           const currentBest = {};
           const prCounts = {}; // Track PRs per competition
+          const prEvents = new Set(); // Track specific events in comps that had PRs: "compId:eventId"
           
           EVENT_ORDER.forEach(e => {
               timeline[e] = [];
@@ -319,7 +322,6 @@
                   getRoundPriority(a.round) - getRoundPriority(b.round)
               );
               
-              // Initialize PR count for this comp if needed, but safer to do it on use
               if (!prCounts[comp.id]) prCounts[comp.id] = 0;
 
               sortedResults.forEach(res => {
@@ -356,15 +358,73 @@
                   }
       
                   if (entries.length > 0) {
+                      prEvents.add(`${comp.id}:${eventId}`);
                       entries.forEach(entry => {
                           timeline[eventId].push({ ...entry, compName, date, round: res.round });
-                          prCounts[comp.id] = (prCounts[comp.id] || 0) + 1; // Increment PR count for this competition
+                          prCounts[comp.id] = (prCounts[comp.id] || 0) + 1; 
                       });
                   }
               });
           });
           Object.keys(timeline).forEach(k => timeline[k].length === 0 && delete timeline[k]);
-          return { timeline, prCounts };
+          return { timeline, prCounts, prEvents };
+        };
+
+        const getAnnualStatistics = (historyData, prCounts) => {
+            if (!historyData || historyData.length === 0) return [];
+
+            // 1. Find Year Range
+            const years = historyData.map(d => d.year);
+            const minYear = Math.min(...years);
+            const currentYear = new Date().getFullYear();
+            const maxYear = Math.max(currentYear, ...years);
+
+            // 2. Create Map for quick lookup
+            const dataMap = new Map(historyData.map(d => [d.year, d]));
+
+            // 3. Generate Range (Descending: Latest -> Earliest)
+            // This ensures the X-axis of charts is Latest -> Earliest as requested (Visual: Left=Latest, Right=Earliest)
+            const stats = [];
+            
+            for (let year = maxYear; year >= minYear; year--) {
+                const yearData = dataMap.get(year);
+                
+                let yearComps = 0;
+                let yearSolves = 0;
+                let yearAttempts = 0;
+                let yearPodiums = 0;
+                let yearPRs = 0;
+
+                if (yearData) {
+                    yearData.competitions.forEach(comp => {
+                        yearComps++;
+                        yearSolves += comp.solvesCount;
+                        yearAttempts += comp.attemptsCount;
+                        yearPRs += (prCounts[comp.id] || 0);
+
+                        comp.results.forEach(res => {
+                            // Count podiums for Final rounds only
+                            if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                                yearPodiums++;
+                            }
+                        });
+                    });
+                }
+
+                stats.push({
+                    year: year,
+                    comps: yearComps,
+                    solves: yearSolves,
+                    attempts: yearAttempts,
+                    podiums: yearPodiums,
+                    prs: yearPRs,
+                    podiumsPerComp: yearComps > 0 ? (yearPodiums / yearComps) : 0,
+                    prsPerComp: yearComps > 0 ? (yearPRs / yearComps) : 0,
+                    solvesPerComp: yearComps > 0 ? (yearSolves / yearComps) : 0
+                });
+            }
+
+            return stats;
         };
 
         // Aggregates stats for a specific year (or All Time)
@@ -489,10 +549,13 @@
             });
 
             // Timeline and PR Counts
-            const { timeline, prCounts } = calculateTimelineAndCounts(historyData, compMetadata, selectedYear);
+            const { timeline, prCounts, prEvents } = calculateTimelineAndCounts(historyData, compMetadata, isAllTime ? 'All Time' : selectedYear);
             
             let totalPRs = 0;
             Object.values(timeline).forEach(arr => totalPRs += arr.length);
+
+            // Annual Statistics for Graphs (Only relevant for All Time view, but good to have)
+            const annualStats = isAllTime ? getAnnualStatistics(historyData, prCounts) : [];
 
             return {
                 ...currentStats, // totalComps, totalSolves etc.
@@ -502,8 +565,10 @@
                 attemptCounts: yearAttemptCounts,
                 statsComps,
                 prCounts, // Map of CompID -> Number of PRs
+                prEvents, // Set of strings "compId:eventId"
                 totalPRs, // Sum of PRs in current period
-                prevTotalPRs // Sum of PRs in previous period (for trend)
+                prevTotalPRs, // Sum of PRs in previous period (for trend)
+                annualStats // Array of stats per year
             };
         };
 
@@ -667,6 +732,112 @@
             });
         };
 
+        const renderStatsCharts = (annualStats) => {
+            // Helper to clean up chart instances
+            const destroyChart = (id) => {
+                if (statsChartInstances[id]) {
+                    statsChartInstances[id].destroy();
+                    delete statsChartInstances[id];
+                }
+            };
+
+            const labels = annualStats.map(s => s.year);
+            const commonOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8' } },
+                },
+                scales: {
+                    y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8', beginAtZero: true } },
+                    x: { grid: { display: false }, ticks: { color: '#94a3b8' } }
+                }
+            };
+
+            // 1. Solves & Attempts
+            const ctx1 = document.getElementById('chartSolvesAttempts');
+            if (ctx1) {
+                destroyChart('solvesAttempts');
+                statsChartInstances['solvesAttempts'] = new Chart(ctx1, {
+                    type: 'bar',
+                    data: {
+                        labels,
+                        datasets: [
+                            { label: 'Attempts', data: annualStats.map(s => s.attempts), backgroundColor: '#475569' },
+                            { label: 'Solves', data: annualStats.map(s => s.solves), backgroundColor: '#818cf8' }
+                        ]
+                    },
+                    options: commonOptions
+                });
+            }
+
+            // 2. Competitions
+            const ctx2 = document.getElementById('chartComps');
+            if (ctx2) {
+                destroyChart('comps');
+                statsChartInstances['comps'] = new Chart(ctx2, {
+                    type: 'bar',
+                    data: { labels, datasets: [{ label: 'Competitions', data: annualStats.map(s => s.comps), backgroundColor: '#34d399' }] },
+                    options: commonOptions
+                });
+            }
+
+            // 3. Podiums
+            const ctx3 = document.getElementById('chartPodiums');
+            if (ctx3) {
+                destroyChart('podiums');
+                statsChartInstances['podiums'] = new Chart(ctx3, {
+                    type: 'bar',
+                    data: { labels, datasets: [{ label: 'Podiums', data: annualStats.map(s => s.podiums), backgroundColor: '#facc15' }] },
+                    options: commonOptions
+                });
+            }
+
+            // 4. PRs
+            const ctx4 = document.getElementById('chartPRs');
+            if (ctx4) {
+                destroyChart('prs');
+                statsChartInstances['prs'] = new Chart(ctx4, {
+                    type: 'bar',
+                    data: { labels, datasets: [{ label: 'PRs', data: annualStats.map(s => s.prs), backgroundColor: '#c084fc' }] },
+                    options: commonOptions
+                });
+            }
+
+            // 5. Podiums per Comp
+            const ctx5 = document.getElementById('chartPodiumsRate');
+            if (ctx5) {
+                destroyChart('podiumsRate');
+                statsChartInstances['podiumsRate'] = new Chart(ctx5, {
+                    type: 'line',
+                    data: { labels, datasets: [{ label: 'Podiums / Comp', data: annualStats.map(s => s.podiumsPerComp), borderColor: '#facc15', backgroundColor: '#facc15', tension: 0.3 }] },
+                    options: commonOptions
+                });
+            }
+
+            // 6. PRs per Comp
+            const ctx6 = document.getElementById('chartPRsRate');
+            if (ctx6) {
+                destroyChart('prsRate');
+                statsChartInstances['prsRate'] = new Chart(ctx6, {
+                    type: 'line',
+                    data: { labels, datasets: [{ label: 'PRs / Comp', data: annualStats.map(s => s.prsPerComp), borderColor: '#c084fc', backgroundColor: '#c084fc', tension: 0.3 }] },
+                    options: commonOptions
+                });
+            }
+
+            // 7. Solves per Comp
+            const ctx7 = document.getElementById('chartSolvesRate');
+            if (ctx7) {
+                destroyChart('solvesRate');
+                statsChartInstances['solvesRate'] = new Chart(ctx7, {
+                    type: 'line',
+                    data: { labels, datasets: [{ label: 'Solves / Comp', data: annualStats.map(s => s.solvesPerComp), borderColor: '#818cf8', backgroundColor: '#818cf8', tension: 0.3 }] },
+                    options: commonOptions
+                });
+            }
+        };
+
         // --- RENDERING COMPONENTS ---
 
         const TrendIndicator = (current, previous) => {
@@ -695,6 +866,81 @@
                     ${subtext ? `<div class="text-slate-500 text-xs mt-1">${subtext}</div>` : ''}
                 </div>
             </div>`;
+
+        const StatsSection = (annualStats) => {
+            if (!annualStats || annualStats.length === 0) return '';
+            
+            const createTableRows = (mapper) => {
+                let total = 0;
+                let rows = annualStats.map(s => {
+                   const val = mapper(s);
+                   if (typeof val === 'number' && !Number.isInteger(val)) return val; // For averages, we handle total differently
+                   total += val;
+                   return val;
+                }).map((val, i) => `
+                   <tr class="border-b border-slate-800 last:border-0 hover:bg-slate-800/50">
+                       <td class="px-4 py-2 font-mono text-slate-400">${annualStats[i].year}</td>
+                       <td class="px-4 py-2 text-white font-bold text-right">${typeof val === 'number' && !Number.isInteger(val) ? val.toFixed(2) : val}</td>
+                   </tr>
+                `).join('');
+                
+                return rows;
+            };
+
+            const createContainer = (title, chartId, tableRows, footerValue) => `
+                <div class="bg-slate-950 rounded-xl border border-slate-800 overflow-hidden flex flex-col">
+                    <div class="p-4 border-b border-slate-800 font-bold text-white text-lg flex items-center gap-2">
+                        ${title}
+                    </div>
+                    <div class="h-64 p-4 relative">
+                        <canvas id="${chartId}"></canvas>
+                    </div>
+                    <div class="bg-slate-900 border-t border-slate-800">
+                        <div class="max-h-48 overflow-y-auto no-scrollbar">
+                            <table class="w-full text-sm text-left">
+                                <thead class="bg-slate-950 text-slate-500 text-xs uppercase sticky top-0">
+                                    <tr><th class="px-4 py-2">Year</th><th class="px-4 py-2 text-right">Value</th></tr>
+                                </thead>
+                                <tbody>${tableRows}</tbody>
+                                <tfoot class="bg-slate-950 border-t border-slate-800 font-bold text-indigo-400">
+                                    <tr><td class="px-4 py-2">All Time</td><td class="px-4 py-2 text-right">${footerValue}</td></tr>
+                                </tfoot>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const totalSolves = annualStats.reduce((acc, c) => acc + c.solves, 0);
+            const totalAttempts = annualStats.reduce((acc, c) => acc + c.attempts, 0);
+            const totalComps = annualStats.reduce((acc, c) => acc + c.comps, 0);
+            const totalPodiums = annualStats.reduce((acc, c) => acc + c.podiums, 0);
+            const totalPRs = annualStats.reduce((acc, c) => acc + c.prs, 0);
+            
+            // For Rates, "All Time" is calculated globally
+            const ratePodiums = totalComps > 0 ? (totalPodiums / totalComps).toFixed(2) : "0.00";
+            const ratePRs = totalComps > 0 ? (totalPRs / totalComps).toFixed(2) : "0.00";
+            const rateSolves = totalComps > 0 ? (totalSolves / totalComps).toFixed(2) : "0.00";
+
+            return `
+                <div class="mt-12 pt-10 border-t border-slate-800">
+                    <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="bar-chart-2" class="text-indigo-400 w-6 h-6"></i> Annual Statistics</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                        ${createContainer("Solves vs Attempts", "chartSolvesAttempts", 
+                            annualStats.map(s => `<tr class="border-b border-slate-800 last:border-0 hover:bg-slate-800/50"><td class="px-4 py-2 font-mono text-slate-400">${s.year}</td><td class="px-4 py-2 text-white font-bold text-right">${s.solves} / ${s.attempts}</td></tr>`).join(''), 
+                            `${totalSolves} / ${totalAttempts}`)}
+                        
+                        ${createContainer("Competitions", "chartComps", createTableRows(s => s.comps), totalComps)}
+                        ${createContainer("Podiums", "chartPodiums", createTableRows(s => s.podiums), totalPodiums)}
+                        ${createContainer("PRs", "chartPRs", createTableRows(s => s.prs), totalPRs)}
+                        
+                        ${createContainer("Podiums per Comp", "chartPodiumsRate", createTableRows(s => s.podiumsPerComp), ratePodiums)}
+                        ${createContainer("PRs per Comp", "chartPRsRate", createTableRows(s => s.prsPerComp), ratePRs)}
+                        ${createContainer("Solves per Comp", "chartSolvesRate", createTableRows(s => s.solvesPerComp), rateSolves)}
+                    </div>
+                </div>
+            `;
+        };
 
         // --- COMPETITION ITEM (UPDATED FOR ALL ROUNDS + PODIUM HIGHLIGHTING + PR Counts) ---
         const CompetitionItem = (comp, prCount) => {
@@ -954,12 +1200,13 @@
                                 <div>
                                     <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-6"><i data-lucide="medal" class="text-indigo-400 w-5 h-5"></i> Medal Breakdown (Final Rounds)</h3>
                                     ${Object.keys(stats.medalStats).length > 0 ? MedalTable(stats.medalStats) : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="trophy" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No podiums found in this selection.</div>`}
+                                    ${isAllTime ? StatsSection(stats.annualStats) : ''}
                                 </div>
                             ` : activeTab === 'competitions' ? `
                                 <div class="space-y-6">
                                     <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (All Rounds & Podiums)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
                                     <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
-                                        ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0)).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
+                                        ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0, stats.prEvents)).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
                                     </div>
                                 </div>
                             ` : activeTab === 'records' ? `
@@ -1010,6 +1257,10 @@
 
             if (activeTab === 'solves' && selectedEvent) {
                 setTimeout(() => renderSolvesChart(stats.statsComps, selectedEvent), 50);
+            }
+
+            if (activeTab === 'overview' && isAllTime && stats.annualStats) {
+                setTimeout(() => renderStatsCharts(stats.annualStats), 50);
             }
         };
 
