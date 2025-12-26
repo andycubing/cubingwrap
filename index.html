@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WCA Career Summary</title>
+    <title>Cuber WCA Career Summary</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
@@ -108,6 +108,7 @@
         let error = null;
         let selectedYear = 'All Time';
         let activeTab = 'overview';
+        let viewMode = 'profile'; // 'profile' or 'leaderboard'
         let compMetadata = {};
         let loadingMetadata = false;
         let metadataFetchInProgress = false; 
@@ -122,7 +123,7 @@
 
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
-            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
+            selectedYear, activeTab, viewMode, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
             leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardSort
         };
 
@@ -289,7 +290,7 @@
         // --- LEADERBOARD LOGIC ---
         
         const fetchLeaderboard = async () => {
-            const { leaderboardLimit } = window.state;
+            const { leaderboardLimit, selectedYear } = window.state;
             window.setState({ isGeneratingLeaderboard: true, leaderboardProgress: 0, leaderboardData: [] });
             
             try {
@@ -310,22 +311,12 @@
                         if (personRes.ok) {
                             const personData = await personRes.json();
                             const history = processWcaData(personData);
-                            // We need to calculate stats for the selected year context (All Time or specific year)
-                            // Note: For leaderboard, we'll calculate based on window.state.selectedYear
-                            // But usually leaderboards are All-Time. Let's respect the year filter.
-                            
-                            // To minimize API calls for metadata, we will approximate comp info or rely on simple counts
-                            // Actually, calculating Overseas count requires Comp Metadata. 
-                            // We CANNOT fetch metadata for 50 people * 50 comps. 
-                            // SIMPLIFICATION: We will infer Country from CompID (e.g. "HK" is local).
-                            // A more robust way is scanning the ID suffix or relying on basic heuristics.
-                            // Here we will use a basic heuristic: If compId ends in 'HK' or 'HongKong', it's local.
                             
                             results.push({
                                 id: personData.id,
                                 name: personData.name,
                                 avatar: `https://flagcdn.com/w40/${personData.country.toLowerCase()}.png`,
-                                stats: calculateLeaderboardStats(history, personData.country)
+                                stats: calculateLeaderboardStats(history, personData.country, selectedYear)
                             });
                         }
                     } catch (e) {
@@ -343,10 +334,9 @@
             }
         };
         
-        const calculateLeaderboardStats = (historyData, homeCountry) => {
-             const { selectedYear } = window.state;
-             const isAllTime = selectedYear === 'All Time';
-             const targetYear = isAllTime ? null : parseInt(selectedYear);
+        const calculateLeaderboardStats = (historyData, homeCountry, targetYearStr) => {
+             const isAllTime = targetYearStr === 'All Time';
+             const targetYear = isAllTime ? null : parseInt(targetYearStr);
              
              // Filter competitions
              const comps = isAllTime 
@@ -360,14 +350,11 @@
             let overseas = 0;
             
             // PR Calculation
-            // We need to simulate the timeline for this person to count PRs correctly within the timeframe
-            // Reuse logic from calculateTimelineAndCounts but localized
             const currentBest = {};
             EVENT_ORDER.forEach(e => currentBest[e] = { single: Infinity, average: Infinity });
             
             // Sort all comps historically for PR calc
             const allHistoryComps = historyData.flatMap(y => y.competitions).sort((a,b) => {
-                 // heuristic sort by ID year + ID alpha since we lack dates for everyone
                  const yA = extractYearFromId(a.id);
                  const yB = extractYearFromId(b.id);
                  return yA - yB || a.id.localeCompare(b.id);
@@ -379,20 +366,6 @@
                 const compYear = extractYearFromId(comp.id);
                 const isInFilter = isAllTime || compYear === targetYear;
                 
-                // Comp-level stats (only if in filter)
-                if (isInFilter) {
-                    // Heuristic for Country/Overseas
-                    // Comp IDs usually end in Country Name or ISO. e.g. 2017HongKongOpen -> HongKong
-                    // We'll count unique "suffixes" or just basic check.
-                    // Actually, simpler: just count unique comp locations if we had them.
-                    // Without metadata, "Countries Visited" is hard.
-                    // We will return 0 for now or try to parse ID.
-                    // Parsing ID: "HongKongOpen2017" -> "HongKong" doesn't work well for "AsianChampionship2017".
-                    // Let's count Comps and Solves which are accurate.
-                    // We will skip Overseas/Country count for Leaderboard to be safe/accurate without metadata.
-                    // Or we can try to assume the Person Country is the 'Home' country.
-                }
-
                 comp.results.forEach(res => {
                     let isPR = false;
                     if (res.best > 0 && res.best < currentBest[res.event].single) {
@@ -1112,6 +1085,11 @@
                  sortedData.sort((a, b) => b.stats[leaderboardSort] - a.stats[leaderboardSort]);
              }
              
+             // Generate Year Options
+             const currentYear = new Date().getFullYear();
+             const years = [];
+             for(let y = currentYear; y >= 2000; y--) years.push(y);
+             
              const renderRow = (item, index) => `
                 <tr class="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
                     <td class="px-4 py-3 font-mono text-slate-500 w-12 text-center">#${index + 1}</td>
@@ -1133,16 +1111,20 @@
              `;
              
              return `
-                <div class="space-y-6">
+                <div class="space-y-6 animate-fade-in-up">
                     <div class="flex flex-col md:flex-row md:items-end justify-between gap-4 bg-slate-800/30 p-6 rounded-xl border border-slate-700/50">
                         <div>
                              <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-2"><i data-lucide="trophy" class="text-indigo-400 w-6 h-6"></i> HK Stats Leaderboard Generator</h3>
                              <p class="text-sm text-slate-400 max-w-xl">
-                                Generate rankings for the <strong class="text-white">Selected Year (${selectedYear})</strong> based on the top HK 3x3 speedcubers. 
+                                Generate rankings based on the top HK 3x3 speedcubers. 
                                 <br><span class="text-orange-400 text-xs"><i data-lucide="alert-triangle" class="w-3 h-3 inline"></i> Calculating stats for many people takes time. Start small (Top 10-20).</span>
                              </p>
                         </div>
-                        <div class="flex items-center gap-3">
+                        <div class="flex items-center gap-3 flex-wrap">
+                            <select onchange="window.setState({ selectedYear: this.value })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5">
+                                <option value="All Time" ${selectedYear === 'All Time' ? 'selected' : ''}>All Time</option>
+                                ${years.map(y => `<option value="${y}" ${selectedYear == y ? 'selected' : ''}>${y}</option>`).join('')}
+                            </select>
                             <select id="leaderboardLimitSelect" onchange="window.setState({ leaderboardLimit: parseInt(this.value) })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5">
                                 <option value="10" ${window.state.leaderboardLimit === 10 ? 'selected' : ''}>Top 10 3x3 Cubers</option>
                                 <option value="20" ${window.state.leaderboardLimit === 20 ? 'selected' : ''}>Top 20 3x3 Cubers</option>
@@ -1406,126 +1388,144 @@
 
         // --- MAIN RENDER FUNCTION ---
         const renderApp = () => {
-            const { userData, loading, error, historyData, selectedYear, activeTab, compMetadata, loadingMetadata, selectedEvent } = window.state;
+            const { userData, loading, error, historyData, selectedYear, activeTab, viewMode, compMetadata, loadingMetadata, selectedEvent } = window.state;
             const isAllTime = selectedYear === 'All Time';
             
-            const stats = calculateStats(window.state);
+            // Calculate stats if we have data and are in profile mode
+            let stats = null;
+            let currentTotalMedals = 0;
+            let prevTotalMedals = null;
             
-            // Trigger metadata fetch for display logic
-            if (!loading && !error && !window.state.metadataFetchInProgress) {
-                if (stats.statsComps.length > 0) {
-                    const ids = stats.statsComps.map(c => c.id);
-                    fetchCompDetails(ids);
+            if (userData && historyData) {
+                stats = calculateStats(window.state);
+                // Trigger metadata fetch for display logic
+                if (!loading && !error && !window.state.metadataFetchInProgress) {
+                    if (stats.statsComps.length > 0) {
+                        const ids = stats.statsComps.map(c => c.id);
+                        fetchCompDetails(ids);
+                    }
                 }
+                
+                currentTotalMedals = stats.medals.gold + stats.medals.silver + stats.medals.bronze;
+                prevTotalMedals = stats.prevStats?.medals ? (stats.prevStats.medals.gold + stats.prevStats.medals.silver + stats.prevStats.medals.bronze) : null;
             }
-            
-            const currentTotalMedals = stats.medals.gold + stats.medals.silver + stats.medals.bronze;
-            const prevTotalMedals = stats.prevStats?.medals ? (stats.prevStats.medals.gold + stats.prevStats.medals.silver + stats.prevStats.medals.bronze) : null;
 
             const appHtml = `
                 <header class="bg-slate-950 border-b border-slate-800 sticky top-0 z-20">
                     <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
-                        <div class="flex items-center gap-3 shrink-0">
-                            <div class="bg-indigo-600 p-2 rounded-lg"><i data-lucide="cuboid" class="text-white w-5 h-5"></i></div>
-                            <h1 class="text-xl font-bold hidden sm:block bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">CuberWCASummary</h1>
+                        <div class="flex items-center gap-6 shrink-0">
+                            <div class="flex items-center gap-3">
+                                <div class="bg-indigo-600 p-2 rounded-lg"><i data-lucide="cuboid" class="text-white w-5 h-5"></i></div>
+                                <h1 class="text-xl font-bold hidden sm:block bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">CuberWCASummary</h1>
+                            </div>
+                            
+                            <!-- Main Navigation -->
+                            <div class="flex items-center bg-slate-900/50 p-1 rounded-lg border border-slate-800">
+                                <button onclick="window.setState({ viewMode: 'profile' })" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all ${viewMode === 'profile' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}">Profile</button>
+                                <button onclick="window.setState({ viewMode: 'leaderboard', selectedYear: 'All Time' })" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all ${viewMode === 'leaderboard' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}">Leaderboard</button>
+                            </div>
                         </div>
-                        <form id="searchForm" class="flex-1 max-w-md relative">
+                        
+                        ${viewMode === 'profile' ? `
+                        <form id="searchForm" class="flex-1 max-w-md relative ml-auto">
                             <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 w-4 h-4"></i>
                             <input type="text" id="wcaSearchInput" placeholder="Enter WCA ID (e.g., 2017KWAN05)" class="w-full bg-slate-900 border border-slate-700 rounded-full py-2 pl-10 pr-4 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all" value="${window.state.inputWcaId}" />
                         </form>
+                        ` : '<div class="flex-1"></div>'}
                     </div>
                 </header>
 
                 <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-                    ${loading ? `<div class="flex flex-col items-center justify-center py-20 text-indigo-400"><i data-lucide="loader-2" class="animate-spin mb-4 w-12 h-12"></i><p>Fetching WCA Data...</p></div>` 
-                    : error ? `<div class="flex flex-col items-center justify-center py-20 text-red-400"><i data-lucide="alert-circle" class="mb-4 w-12 h-12"></i><p class="text-lg font-bold">Error Loading Data</p><p class="text-sm opacity-80">${error}</p><p class="text-xs mt-4 text-slate-500">Check WCA ID.</p></div>` 
-                    : !userData ? `<div class="text-center py-20 text-slate-500"><p>No data available. Use the search bar to load a WCA ID.</p></div>` 
-                    : `
-                        <div class="flex overflow-x-auto pb-4 mb-6 gap-2 no-scrollbar border-b border-slate-800/50">
-                            <button onclick="window.setState({ selectedYear: 'All Time', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === 'All Time' ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">All Time</button>
-                            ${historyData.map(h => `<button onclick="window.setState({ selectedYear: '${h.year}', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === String(h.year) ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">${h.year}</button>`).join('')}
-                        </div>
-
-                        <div class="flex flex-col md:flex-row items-center md:items-start gap-6 mb-10">
-                            <img src="https://flagcdn.com/w160/${userData.country.toLowerCase()}.png" alt="${userData.country} Flag" class="w-20 h-20 rounded-full border-4 border-slate-800 shadow-xl bg-slate-700 object-cover" onerror="this.onerror=null; this.src='https://placehold.co/80x80/1f2937/6b7280?text=${userData.country}';" />
-                            <div class="text-center md:text-left flex-1">
-                                <h2 class="text-3xl font-bold text-white">${userData.name}</h2>
-                                <div class="flex items-center justify-center md:justify-start gap-3 mt-2 text-slate-400">
-                                <span class="flex items-center gap-1 text-sm bg-slate-800 px-2 py-0.5 rounded border border-slate-700"><i data-lucide="hash" class="w-3 h-3"></i> ${userData.wcaId}</span>
-                                <span class="flex items-center gap-1 text-sm bg-slate-800 px-2 py-0.5 rounded border border-slate-700"><i data-lucide="globe" class="w-3 h-3"></i> ${userData.country}</span>
-                                </div>
-                                <div class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 bg-slate-900/50 p-4 rounded-lg border border-slate-800/50">
-                                    <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Total Attempts</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.totalAttempts} ${TrendIndicator(stats.totalAttempts, stats.prevStats?.totalAttempts)}</div></div>
-                                    <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Success Rate</div><div class="text-indigo-400 font-mono font-bold">${stats.totalAttempts > 0 ? ((stats.totalSolves / stats.totalAttempts) * 100).toFixed(1) : 0}%</div></div>
-                                    <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Countries Visited</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.uniqueCountries} ${loadingMetadata ? `<i data-lucide="loader-2" class="animate-spin w-2.5 h-2.5"></i>` : ''} ${TrendIndicator(stats.uniqueCountries, stats.prevStats?.uniqueCountries)}</div></div>
-                                    <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Overseas Comps</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.overseasCount} ${TrendIndicator(stats.overseasCount, stats.prevStats?.overseasCount)}</div></div>
-                                </div>
+                    ${viewMode === 'leaderboard' ? LeaderboardView() : `
+                        <!-- Profile View -->
+                        ${loading ? `<div class="flex flex-col items-center justify-center py-20 text-indigo-400"><i data-lucide="loader-2" class="animate-spin mb-4 w-12 h-12"></i><p>Fetching WCA Data...</p></div>` 
+                        : error ? `<div class="flex flex-col items-center justify-center py-20 text-red-400"><i data-lucide="alert-circle" class="mb-4 w-12 h-12"></i><p class="text-lg font-bold">Error Loading Data</p><p class="text-sm opacity-80">${error}</p><p class="text-xs mt-4 text-slate-500">Check WCA ID.</p></div>` 
+                        : !userData ? `<div class="text-center py-20 text-slate-500"><p>No data available. Use the search bar to load a WCA ID.</p></div>` 
+                        : `
+                            <div class="flex overflow-x-auto pb-4 mb-6 gap-2 no-scrollbar border-b border-slate-800/50">
+                                <button onclick="window.setState({ selectedYear: 'All Time', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === 'All Time' ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">All Time</button>
+                                ${historyData.map(h => `<button onclick="window.setState({ selectedYear: '${h.year}', selectedEvent: null })" class="px-5 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all border ${selectedYear === String(h.year) ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:border-slate-600'}">${h.year}</button>`).join('')}
                             </div>
-                        </div>
 
-                        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-                            ${StatCard({ title: "Competitions", value: stats.totalComps, trendHtml: TrendIndicator(stats.totalComps, stats.prevStats?.totalComps), icon: "calendar", colorClass: "text-blue-400 bg-blue-400/10" })}
-                            ${StatCard({ title: "Total Solves", value: stats.totalSolves, trendHtml: TrendIndicator(stats.totalSolves, stats.prevStats?.totalSolves), icon: "activity", colorClass: "text-emerald-400 bg-emerald-400/10" })}
-                            ${StatCard({ title: "Total PRs", value: stats.totalPRs, trendHtml: TrendIndicator(stats.totalPRs, stats.prevTotalPRs), icon: "trending-up", colorClass: "text-purple-400 bg-purple-400/10" })}
-                            ${StatCard({ title: "Total Medals", value: currentTotalMedals, subtext: `${stats.medals.gold} Gold, ${stats.medals.silver} Silver, ${stats.medals.bronze} Bronze`, trendHtml: TrendIndicator(currentTotalMedals, prevTotalMedals), icon: "trophy", colorClass: "text-yellow-400 bg-yellow-400/10" })}
-                        </div>
-
-                        <div class="border-b border-slate-800 mb-8">
-                            <nav class="flex overflow-x-auto space-x-8 pb-1 no-scrollbar">
-                                ${['overview', 'competitions', 'records', 'solves', 'leaderboards'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab.replace('_', ' ')}</button>`).join('')}
-                            </nav>
-                        </div>
-
-                        <div class="animate-fade-in-up">
-                            ${activeTab === 'overview' ? `
-                                <div>
-                                    <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-6"><i data-lucide="medal" class="text-indigo-400 w-5 h-5"></i> Medal Breakdown (Final Rounds)</h3>
-                                    ${Object.keys(stats.medalStats).length > 0 ? MedalTable(stats.medalStats) : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="trophy" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No podiums found in this selection.</div>`}
-                                    ${isAllTime ? StatsSection(stats.annualStats) : ''}
-                                </div>
-                            ` : activeTab === 'competitions' ? `
-                                <div class="space-y-6">
-                                    <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (Podiums & PRs)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
-                                    <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
-                                        ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0, stats.prsByComp[comp.id])).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
+                            <div class="flex flex-col md:flex-row items-center md:items-start gap-6 mb-10">
+                                <img src="https://flagcdn.com/w160/${userData.country.toLowerCase()}.png" alt="${userData.country} Flag" class="w-20 h-20 rounded-full border-4 border-slate-800 shadow-xl bg-slate-700 object-cover" onerror="this.onerror=null; this.src='https://placehold.co/80x80/1f2937/6b7280?text=${userData.country}';" />
+                                <div class="text-center md:text-left flex-1">
+                                    <h2 class="text-3xl font-bold text-white">${userData.name}</h2>
+                                    <div class="flex items-center justify-center md:justify-start gap-3 mt-2 text-slate-400">
+                                    <span class="flex items-center gap-1 text-sm bg-slate-800 px-2 py-0.5 rounded border border-slate-700"><i data-lucide="hash" class="w-3 h-3"></i> ${userData.wcaId}</span>
+                                    <span class="flex items-center gap-1 text-sm bg-slate-800 px-2 py-0.5 rounded border border-slate-700"><i data-lucide="globe" class="w-3 h-3"></i> ${userData.country}</span>
+                                    </div>
+                                    <div class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 bg-slate-900/50 p-4 rounded-lg border border-slate-800/50">
+                                        <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Total Attempts</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.totalAttempts} ${TrendIndicator(stats.totalAttempts, stats.prevStats?.totalAttempts)}</div></div>
+                                        <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Success Rate</div><div class="text-indigo-400 font-mono font-bold">${stats.totalAttempts > 0 ? ((stats.totalSolves / stats.totalAttempts) * 100).toFixed(1) : 0}%</div></div>
+                                        <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Countries Visited</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.uniqueCountries} ${loadingMetadata ? `<i data-lucide="loader-2" class="animate-spin w-2.5 h-2.5"></i>` : ''} ${TrendIndicator(stats.uniqueCountries, stats.prevStats?.uniqueCountries)}</div></div>
+                                        <div class="text-center md:text-left"><div class="text-xs text-slate-500 uppercase">Overseas Comps</div><div class="text-white font-mono font-bold flex items-center justify-center md:justify-start gap-2">${stats.overseasCount} ${TrendIndicator(stats.overseasCount, stats.prevStats?.overseasCount)}</div></div>
                                     </div>
                                 </div>
-                            ` : activeTab === 'records' ? `
-                                <div>
-                                    <h3 class="text-2xl font-bold text-white mb-8 flex items-center gap-2"><i data-lucide="timer" class="text-indigo-400 w-6 h-6"></i> Personal Records</h3>
-                                    ${!stats.totalComps ? `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="alert-circle" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competition data for this period.</div>` : selectedYear === 'All Time' ? `${RecordTable(stats.pb, "All-Time Personal Records (PRs)", true, 'pb')}` : `${RecordTable(stats.sb, `Best Results in ${selectedYear}`, false, 'sb', stats.pb)}${RecordTable(stats.pb, `All-Time Personal Records (PRs) Up To ${selectedYear}`, false, 'pb')}`}
-                                </div>
-                            ` : activeTab === 'solves' ? `
-                                <div>
-                                    <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="layers" class="text-indigo-400 w-6 h-6"></i> Solve Analysis (Graph and Timeline)</h3>
-                                    <p class="text-slate-400 text-sm mb-6">Click the event button to learn your progression!</p>
-                                    ${SolveCountTable(stats.solveCounts, stats.attemptCounts)}
-                                    
-                                    ${selectedEvent ? `
-                                        <div class="mb-10 animate-fade-in-up">
-                                            <div class="flex items-center justify-between mb-4">
-                                                <h3 class="text-xl font-bold text-white flex items-center gap-2">
-                                                    <i data-lucide="line-chart" class="text-indigo-400 w-5 h-5"></i> 
-                                                    ${getEventInfo(selectedEvent).name} Progress
-                                                </h3>
-                                                <div class="text-xs text-slate-500">Excludes DNF/DNS</div>
-                                            </div>
-                                            <div class="bg-slate-950 p-4 rounded-xl border border-slate-800 h-[600px] relative">
-                                                <canvas id="solvesChart"></canvas>
-                                            </div>
-                                        </div>
-                                    ` : ''}
+                            </div>
 
-                                    <h3 id="record-timeline" class="text-2xl font-bold text-white mb-8 flex items-center gap-2">
-                                        <i data-lucide="trending-up" class="text-emerald-400 w-6 h-6"></i>
-                                        ${selectedEvent ? `${getEventInfo(selectedEvent).name} Record Timeline` : 'Record Timeline'}
-                                    </h3>
-                                    ${TimelineView(stats.timeline, selectedEvent)}
-                                </div>
-                            ` : activeTab === 'leaderboards' ? `
-                                ${LeaderboardView()}
-                            ` : ''}
-                        </div>
+                            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                                ${StatCard({ title: "Competitions", value: stats.totalComps, trendHtml: TrendIndicator(stats.totalComps, stats.prevStats?.totalComps), icon: "calendar", colorClass: "text-blue-400 bg-blue-400/10" })}
+                                ${StatCard({ title: "Total Solves", value: stats.totalSolves, trendHtml: TrendIndicator(stats.totalSolves, stats.prevStats?.totalSolves), icon: "activity", colorClass: "text-emerald-400 bg-emerald-400/10" })}
+                                ${StatCard({ title: "Total PRs", value: stats.totalPRs, trendHtml: TrendIndicator(stats.totalPRs, stats.prevTotalPRs), icon: "trending-up", colorClass: "text-purple-400 bg-purple-400/10" })}
+                                ${StatCard({ title: "Total Medals", value: currentTotalMedals, subtext: `${stats.medals.gold} Gold, ${stats.medals.silver} Silver, ${stats.medals.bronze} Bronze`, trendHtml: TrendIndicator(currentTotalMedals, prevTotalMedals), icon: "trophy", colorClass: "text-yellow-400 bg-yellow-400/10" })}
+                            </div>
+
+                            <div class="border-b border-slate-800 mb-8">
+                                <nav class="flex overflow-x-auto space-x-8 pb-1 no-scrollbar">
+                                    ${['overview', 'competitions', 'records', 'solves'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab.replace('_', ' ')}</button>`).join('')}
+                                </nav>
+                            </div>
+
+                            <div class="animate-fade-in-up">
+                                ${activeTab === 'overview' ? `
+                                    <div>
+                                        <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-6"><i data-lucide="medal" class="text-indigo-400 w-5 h-5"></i> Medal Breakdown (Final Rounds)</h3>
+                                        ${Object.keys(stats.medalStats).length > 0 ? MedalTable(stats.medalStats) : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="trophy" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No podiums found in this selection.</div>`}
+                                        ${isAllTime ? StatsSection(stats.annualStats) : ''}
+                                    </div>
+                                ` : activeTab === 'competitions' ? `
+                                    <div class="space-y-6">
+                                        <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (Podiums & PRs)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
+                                        <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
+                                            ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0, stats.prsByComp[comp.id])).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
+                                        </div>
+                                    </div>
+                                ` : activeTab === 'records' ? `
+                                    <div>
+                                        <h3 class="text-2xl font-bold text-white mb-8 flex items-center gap-2"><i data-lucide="timer" class="text-indigo-400 w-6 h-6"></i> Personal Records</h3>
+                                        ${!stats.totalComps ? `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="alert-circle" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competition data for this period.</div>` : selectedYear === 'All Time' ? `${RecordTable(stats.pb, "All-Time Personal Records (PRs)", true, 'pb')}` : `${RecordTable(stats.sb, `Best Results in ${selectedYear}`, false, 'sb', stats.pb)}${RecordTable(stats.pb, `All-Time Personal Records (PRs) Up To ${selectedYear}`, false, 'pb')}`}
+                                    </div>
+                                ` : activeTab === 'solves' ? `
+                                    <div>
+                                        <h3 class="text-2xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="layers" class="text-indigo-400 w-6 h-6"></i> Solve Analysis (Graph and Timeline)</h3>
+                                        <p class="text-slate-400 text-sm mb-6">Click the event button to learn your progression!</p>
+                                        ${SolveCountTable(stats.solveCounts, stats.attemptCounts)}
+                                        
+                                        ${selectedEvent ? `
+                                            <div class="mb-10 animate-fade-in-up">
+                                                <div class="flex items-center justify-between mb-4">
+                                                    <h3 class="text-xl font-bold text-white flex items-center gap-2">
+                                                        <i data-lucide="line-chart" class="text-indigo-400 w-5 h-5"></i> 
+                                                        ${getEventInfo(selectedEvent).name} Progress
+                                                    </h3>
+                                                    <div class="text-xs text-slate-500">Excludes DNF/DNS</div>
+                                                </div>
+                                                <div class="bg-slate-950 p-4 rounded-xl border border-slate-800 h-[600px] relative">
+                                                    <canvas id="solvesChart"></canvas>
+                                                </div>
+                                            </div>
+                                        ` : ''}
+
+                                        <h3 id="record-timeline" class="text-2xl font-bold text-white mb-8 flex items-center gap-2">
+                                            <i data-lucide="trending-up" class="text-emerald-400 w-6 h-6"></i>
+                                            ${selectedEvent ? `${getEventInfo(selectedEvent).name} Record Timeline` : 'Record Timeline'}
+                                        </h3>
+                                        ${TimelineView(stats.timeline, selectedEvent)}
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `}
                     `}
                 </main>
             `;
@@ -1538,12 +1538,15 @@
                 searchForm.onsubmit = window.handleSearch;
             }
 
-            if (activeTab === 'solves' && selectedEvent) {
-                setTimeout(() => renderSolvesChart(stats.statsComps, selectedEvent), 50);
-            }
+            // Charts only render if we are in profile view and have stats
+            if (viewMode === 'profile' && stats) {
+                if (activeTab === 'solves' && selectedEvent) {
+                    setTimeout(() => renderSolvesChart(stats.statsComps, selectedEvent), 50);
+                }
 
-            if (activeTab === 'overview' && isAllTime && stats.annualStats) {
-                setTimeout(() => renderStatsCharts(stats.annualStats), 50);
+                if (activeTab === 'overview' && isAllTime && stats.annualStats) {
+                    setTimeout(() => renderStatsCharts(stats.annualStats), 50);
+                }
             }
         };
 
