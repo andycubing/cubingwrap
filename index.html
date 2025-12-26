@@ -112,10 +112,18 @@
         let loadingMetadata = false;
         let metadataFetchInProgress = false; 
         let selectedEvent = null; 
-  
+        
+        // Leaderboard State
+        let leaderboardData = [];
+        let isGeneratingLeaderboard = false;
+        let leaderboardProgress = 0;
+        let leaderboardLimit = 20; // Default limit
+        let leaderboardSort = 'prs'; // default sort
+
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
-            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent
+            selectedYear, activeTab, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
+            leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardSort
         };
 
         let chartInstance = null; 
@@ -277,6 +285,148 @@
                 window.setState({ loading: false });
             }
         };
+        
+        // --- LEADERBOARD LOGIC ---
+        
+        const fetchLeaderboard = async () => {
+            const { leaderboardLimit } = window.state;
+            window.setState({ isGeneratingLeaderboard: true, leaderboardProgress: 0, leaderboardData: [] });
+            
+            try {
+                // 1. Fetch Ranking List (Base HK 3x3 Average as proxy for active cubers)
+                const rankRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/333.json`);
+                if (!rankRes.ok) throw new Error("Failed to fetch rankings");
+                const rankData = await rankRes.json();
+                
+                // 2. Slice top N items
+                const topCubers = rankData.items.slice(0, leaderboardLimit);
+                const results = [];
+                
+                // 3. Process each cuber
+                let processed = 0;
+                for (const item of topCubers) {
+                    try {
+                        const personRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/persons/${item.personId}.json`);
+                        if (personRes.ok) {
+                            const personData = await personRes.json();
+                            const history = processWcaData(personData);
+                            // We need to calculate stats for the selected year context (All Time or specific year)
+                            // Note: For leaderboard, we'll calculate based on window.state.selectedYear
+                            // But usually leaderboards are All-Time. Let's respect the year filter.
+                            
+                            // To minimize API calls for metadata, we will approximate comp info or rely on simple counts
+                            // Actually, calculating Overseas count requires Comp Metadata. 
+                            // We CANNOT fetch metadata for 50 people * 50 comps. 
+                            // SIMPLIFICATION: We will infer Country from CompID (e.g. "HK" is local).
+                            // A more robust way is scanning the ID suffix or relying on basic heuristics.
+                            // Here we will use a basic heuristic: If compId ends in 'HK' or 'HongKong', it's local.
+                            
+                            results.push({
+                                id: personData.id,
+                                name: personData.name,
+                                avatar: `https://flagcdn.com/w40/${personData.country.toLowerCase()}.png`,
+                                stats: calculateLeaderboardStats(history, personData.country)
+                            });
+                        }
+                    } catch (e) {
+                        console.error("Failed for", item.personId);
+                    }
+                    processed++;
+                    window.setState({ leaderboardProgress: Math.round((processed / topCubers.length) * 100) });
+                }
+                
+                window.setState({ leaderboardData: results, isGeneratingLeaderboard: false });
+                
+            } catch (e) {
+                alert("Error generating leaderboard: " + e.message);
+                window.setState({ isGeneratingLeaderboard: false });
+            }
+        };
+        
+        const calculateLeaderboardStats = (historyData, homeCountry) => {
+             const { selectedYear } = window.state;
+             const isAllTime = selectedYear === 'All Time';
+             const targetYear = isAllTime ? null : parseInt(selectedYear);
+             
+             // Filter competitions
+             const comps = isAllTime 
+                ? historyData.flatMap(y => y.competitions) 
+                : historyData.filter(y => y.year === targetYear).flatMap(y => y.competitions);
+            
+            let totalComps = comps.length;
+            let totalSolves = 0;
+            let medals = 0;
+            let countries = new Set();
+            let overseas = 0;
+            
+            // PR Calculation
+            // We need to simulate the timeline for this person to count PRs correctly within the timeframe
+            // Reuse logic from calculateTimelineAndCounts but localized
+            const currentBest = {};
+            EVENT_ORDER.forEach(e => currentBest[e] = { single: Infinity, average: Infinity });
+            
+            // Sort all comps historically for PR calc
+            const allHistoryComps = historyData.flatMap(y => y.competitions).sort((a,b) => {
+                 // heuristic sort by ID year + ID alpha since we lack dates for everyone
+                 const yA = extractYearFromId(a.id);
+                 const yB = extractYearFromId(b.id);
+                 return yA - yB || a.id.localeCompare(b.id);
+            });
+            
+            let prCount = 0;
+            
+            allHistoryComps.forEach(comp => {
+                const compYear = extractYearFromId(comp.id);
+                const isInFilter = isAllTime || compYear === targetYear;
+                
+                // Comp-level stats (only if in filter)
+                if (isInFilter) {
+                    // Heuristic for Country/Overseas
+                    // Comp IDs usually end in Country Name or ISO. e.g. 2017HongKongOpen -> HongKong
+                    // We'll count unique "suffixes" or just basic check.
+                    // Actually, simpler: just count unique comp locations if we had them.
+                    // Without metadata, "Countries Visited" is hard.
+                    // We will return 0 for now or try to parse ID.
+                    // Parsing ID: "HongKongOpen2017" -> "HongKong" doesn't work well for "AsianChampionship2017".
+                    // Let's count Comps and Solves which are accurate.
+                    // We will skip Overseas/Country count for Leaderboard to be safe/accurate without metadata.
+                    // Or we can try to assume the Person Country is the 'Home' country.
+                }
+
+                comp.results.forEach(res => {
+                    let isPR = false;
+                    if (res.best > 0 && res.best < currentBest[res.event].single) {
+                        currentBest[res.event].single = res.best;
+                        if (isInFilter) isPR = true;
+                    }
+                    if (res.event !== '333mbf' && res.average > 0 && res.average < currentBest[res.event].average) {
+                        currentBest[res.event].average = res.average;
+                        if (isInFilter) isPR = true;
+                    }
+                    
+                    if (isInFilter && isPR) prCount++;
+                    
+                    if (isInFilter) {
+                         // Medals (Finals only)
+                        if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                            medals++;
+                        }
+                    }
+                });
+            });
+            
+            comps.forEach(c => totalSolves += c.solvesCount);
+            
+            return {
+                comps: totalComps,
+                solves: totalSolves,
+                prs: prCount,
+                medals: medals,
+                podiumsPerComp: totalComps > 0 ? medals / totalComps : 0,
+                prsPerComp: totalComps > 0 ? prCount / totalComps : 0,
+                solvesPerComp: totalComps > 0 ? totalSolves / totalComps : 0
+            };
+        };
 
         window.handleSearch = (e) => {
             e.preventDefault();
@@ -360,7 +510,8 @@
                   if (entries.length > 0) {
                       prEvents.add(`${comp.id}:${eventId}`);
                       entries.forEach(entry => {
-                          timeline[eventId].push({ ...entry, compName, date, round: res.round });
+                          // ADDED: compId to track where the PR happened
+                          timeline[eventId].push({ ...entry, compName, date, round: res.round, compId: comp.id });
                           prCounts[comp.id] = (prCounts[comp.id] || 0) + 1; 
                       });
                   }
@@ -383,7 +534,6 @@
             const dataMap = new Map(historyData.map(d => [d.year, d]));
 
             // 3. Generate Range (Descending: Latest -> Earliest)
-            // This ensures the X-axis of charts is Latest -> Earliest as requested (Visual: Left=Latest, Right=Earliest)
             const stats = [];
             
             for (let year = maxYear; year >= minYear; year--) {
@@ -551,6 +701,15 @@
             // Timeline and PR Counts
             const { timeline, prCounts, prEvents } = calculateTimelineAndCounts(historyData, compMetadata, isAllTime ? 'All Time' : selectedYear);
             
+            // NEW: Group PRs by Competition ID for easy display
+            const prsByComp = {};
+            Object.keys(timeline).forEach(evt => {
+                timeline[evt].forEach(entry => {
+                    if (!prsByComp[entry.compId]) prsByComp[entry.compId] = [];
+                    prsByComp[entry.compId].push({ ...entry, eventId: evt });
+                });
+            });
+
             let totalPRs = 0;
             Object.values(timeline).forEach(arr => totalPRs += arr.length);
 
@@ -565,6 +724,7 @@
                 attemptCounts: yearAttemptCounts,
                 statsComps,
                 prCounts, // Map of CompID -> Number of PRs
+                prsByComp, // NEW: Map of CompID -> Array of PR Details
                 prEvents, // Set of strings "compId:eventId"
                 totalPRs, // Sum of PRs in current period
                 prevTotalPRs, // Sum of PRs in previous period (for trend)
@@ -941,14 +1101,104 @@
                 </div>
             `;
         };
+        
+        // --- LEADERBOARD VIEW ---
+        const LeaderboardView = () => {
+             const { leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardSort, selectedYear } = window.state;
+             
+             // Sort Data
+             let sortedData = [...leaderboardData];
+             if (leaderboardSort) {
+                 sortedData.sort((a, b) => b.stats[leaderboardSort] - a.stats[leaderboardSort]);
+             }
+             
+             const renderRow = (item, index) => `
+                <tr class="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
+                    <td class="px-4 py-3 font-mono text-slate-500 w-12 text-center">#${index + 1}</td>
+                    <td class="px-4 py-3 flex items-center gap-3">
+                        <img src="${item.avatar}" class="w-8 h-8 rounded-full bg-slate-800 object-cover" onerror="this.style.display='none'">
+                        <div>
+                            <div class="text-white font-bold text-sm">${item.name}</div>
+                            <div class="text-xs text-slate-500">${item.id}</div>
+                        </div>
+                    </td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'comps' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.comps}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'solves' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.solves}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'prs' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.prs}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'medals' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.medals}</td>
+                    <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'podiumsPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.podiumsPerComp.toFixed(2)}</td>
+                    <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'prsPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.prsPerComp.toFixed(2)}</td>
+                    <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'solvesPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.solvesPerComp.toFixed(2)}</td>
+                </tr>
+             `;
+             
+             return `
+                <div class="space-y-6">
+                    <div class="flex flex-col md:flex-row md:items-end justify-between gap-4 bg-slate-800/30 p-6 rounded-xl border border-slate-700/50">
+                        <div>
+                             <h3 class="text-xl font-bold text-white flex items-center gap-2 mb-2"><i data-lucide="trophy" class="text-indigo-400 w-6 h-6"></i> HK Stats Leaderboard Generator</h3>
+                             <p class="text-sm text-slate-400 max-w-xl">
+                                Generate rankings for the <strong class="text-white">Selected Year (${selectedYear})</strong> based on the top HK 3x3 speedcubers. 
+                                <br><span class="text-orange-400 text-xs"><i data-lucide="alert-triangle" class="w-3 h-3 inline"></i> Calculating stats for many people takes time. Start small (Top 10-20).</span>
+                             </p>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <select id="leaderboardLimitSelect" onchange="window.setState({ leaderboardLimit: parseInt(this.value) })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5">
+                                <option value="10" ${window.state.leaderboardLimit === 10 ? 'selected' : ''}>Top 10 3x3 Cubers</option>
+                                <option value="20" ${window.state.leaderboardLimit === 20 ? 'selected' : ''}>Top 20 3x3 Cubers</option>
+                                <option value="50" ${window.state.leaderboardLimit === 50 ? 'selected' : ''}>Top 50 3x3 Cubers</option>
+                            </select>
+                            <button onclick="fetchLeaderboard()" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold rounded-lg transition-colors flex items-center gap-2">
+                                ${isGeneratingLeaderboard ? `<i data-lucide="loader-2" class="animate-spin w-4 h-4"></i> Generating ${leaderboardProgress}%` : `<i data-lucide="play" class="w-4 h-4"></i> Generate Leaderboard`}
+                            </button>
+                        </div>
+                    </div>
 
-        // --- COMPETITION ITEM (UPDATED FOR ALL ROUNDS + PODIUM HIGHLIGHTING + PR Counts) ---
-        const CompetitionItem = (comp, prCount) => {
+                    ${leaderboardData.length > 0 ? `
+                        <div class="overflow-x-auto rounded-xl border border-slate-800 shadow-xl">
+                            <table class="w-full text-left bg-slate-900">
+                                <thead class="bg-slate-950 text-slate-400 text-xs uppercase font-semibold">
+                                    <tr>
+                                        <th class="px-4 py-3 text-center">#</th>
+                                        <th class="px-4 py-3">Cuber</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'comps' })">Comps ${leaderboardSort === 'comps' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'solves' })">Solves ${leaderboardSort === 'solves' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'prs' })">PRs ${leaderboardSort === 'prs' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'medals' })">Medals ${leaderboardSort === 'medals' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'podiumsPerComp' })">Podium Rate ${leaderboardSort === 'podiumsPerComp' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'prsPerComp' })">PR Rate ${leaderboardSort === 'prsPerComp' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'solvesPerComp' })">Solves/Comp ${leaderboardSort === 'solvesPerComp' ? '↓' : ''}</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-800 text-sm">
+                                    ${sortedData.map(renderRow).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    ` : isGeneratingLeaderboard ? `
+                         <div class="py-20 flex flex-col items-center justify-center text-slate-500">
+                            <div class="w-64 h-2 bg-slate-800 rounded-full overflow-hidden mb-4">
+                                <div class="h-full bg-indigo-500 transition-all duration-300 ease-out" style="width: ${leaderboardProgress}%"></div>
+                            </div>
+                            <p class="text-sm">Fetching career data... (${leaderboardProgress}%)</p>
+                        </div>
+                    ` : `
+                        <div class="py-20 text-center text-slate-500 border border-slate-800 rounded-xl border-dashed">
+                            <i data-lucide="bar-chart-big" class="mx-auto mb-3 opacity-20 w-12 h-12"></i>
+                            <p>Click "Generate Leaderboard" to fetch data.</p>
+                        </div>
+                    `}
+                </div>
+             `;
+        };
+
+        // --- COMPETITION ITEM (UPDATED: FIXED WIDTH PR TAGS) ---
+        const CompetitionItem = (comp, prCount, compPRs) => {
             const metadata = window.state.compMetadata[comp.id] || null;
             const compName = metadata?.name || comp.id;
             const link = `https://www.worldcubeassociation.org/competitions/${comp.id}`;
             
-            // Group results by event and sort the rounds within the event
+            // Group results by event
             const eventsMap = new Map();
             comp.results.forEach(res => {
                 if (!eventsMap.has(res.event)) {
@@ -958,6 +1208,10 @@
             });
 
             const eventResultsHtml = Array.from(eventsMap.entries())
+                // FILTER: Only keep events where a podium was achieved in a Final round
+                .filter(([event, rounds]) => {
+                    return rounds.some(r => r.round.includes("Final") && r.place <= 3 && r.best > 0);
+                })
                 .sort(([a], [b]) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b))
                 .map(([event, rounds]) => {
                     const eventInfo = getEventInfo(event);
@@ -967,7 +1221,6 @@
                         let placeClass = 'text-slate-400 border-slate-700/50';
                         let iconHtml = '';
                         
-                        // Valid podium is Top 3 AND the round is a Final round
                         const isFinalRound = res.round.includes("Final"); 
                         
                         if (res.place === 1 && res.best > 0 && isFinalRound) {
@@ -997,6 +1250,33 @@
                             <div class="space-y-1">${roundHtml}</div>
                         </div>`;
                 }).join('');
+            
+            // Build PR List HTML with FIXED WIDTH
+            let prsHtml = '';
+            if (compPRs && compPRs.length > 0) {
+                 // Sort PRs by Event Order
+                 compPRs.sort((a, b) => EVENT_ORDER.indexOf(a.eventId) - EVENT_ORDER.indexOf(b.eventId));
+                 
+                 const prList = compPRs.map(pr => {
+                     const eInfo = getEventInfo(pr.eventId);
+                     // Added w-[180px] and justify-between for uniform length
+                     return `<span class="inline-flex items-center justify-between px-2.5 py-1.5 bg-slate-800 rounded border border-slate-700 text-xs text-slate-300 shadow-sm w-[200px]">
+                        <div class="flex items-center gap-1.5">
+                            <div class="w-1.5 h-1.5 rounded-full ${eInfo.bg}"></div>
+                            <span class="font-bold text-white truncate max-w-[500px]">${eInfo.name}</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span class="font-mono text-indigo-300 font-bold">${pr.formattedResult}</span>
+                            <span class="text-slate-500 text-[10px] uppercase tracking-wide opacity-75">${pr.type.substring(0,7)}</span>
+                        </div>
+                     </span>`;
+                 }).join('');
+                 
+                 prsHtml = `<div class="mt-5 pt-4 border-t border-slate-1500/50 flex flex-wrap gap-2 items-center">
+                    <span class="text-xs font-bold text-emerald-400 uppercase tracking-wider mr-2 flex items-center gap-1"><i data-lucide="trending-up" class="w-3 h-3"></i> PR:</span>
+                    ${prList}
+                 </div>`;
+            }
 
             return `
                 <div class="group relative border-l-2 border-slate-700 pl-6 pb-8 last:pb-0 hover:border-indigo-500 transition-colors">
@@ -1012,7 +1292,8 @@
                             <span class="text-xs font-mono bg-slate-800 px-2 py-1 rounded text-slate-300 border border-slate-700">${comp.solvesCount} Solves</span>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 mt-3">${eventResultsHtml}</div>
+                    ${eventResultsHtml ? `<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 mt-3">${eventResultsHtml}</div>` : ''}
+                    ${prsHtml}
                 </div>`;
         };
 
@@ -1191,7 +1472,7 @@
 
                         <div class="border-b border-slate-800 mb-8">
                             <nav class="flex overflow-x-auto space-x-8 pb-1 no-scrollbar">
-                                ${['overview', 'competitions', 'records', 'solves'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab.replace('_', ' ')}</button>`).join('')}
+                                ${['overview', 'competitions', 'records', 'solves', 'leaderboards'].map((tab) => `<button onclick="window.setState({ activeTab: '${tab}' })" class="pb-4 text-sm font-medium border-b-2 transition-colors capitalize ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-300 hover:border-slate-700'}">${tab.replace('_', ' ')}</button>`).join('')}
                             </nav>
                         </div>
 
@@ -1204,9 +1485,9 @@
                                 </div>
                             ` : activeTab === 'competitions' ? `
                                 <div class="space-y-6">
-                                    <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (All Rounds & Podiums)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
+                                    <div class="flex justify-between items-center"><h3 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="list-checks" class="text-indigo-400 w-5 h-5"></i>Full Competition Results (Podiums & PRs)</h3>${loadingMetadata ? `<span class="text-xs text-indigo-400 flex items-center gap-1"><i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Loading Locations...</span>` : ''}</div>
                                     <div class="bg-slate-950 p-6 rounded-xl border border-slate-800">
-                                        ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0, stats.prEvents)).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
+                                        ${stats.statsComps.length > 0 ? stats.statsComps.sort((a, b) => { const dateA = window.state.compMetadata[a.id]?.date?.from || a.id; const dateB = window.state.compMetadata[b.id]?.date?.from || b.id; return dateB.localeCompare(dateA); }).map(comp => CompetitionItem(comp, stats.prCounts[comp.id] || 0, stats.prsByComp[comp.id])).join('') : `<div class="p-12 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl border-dashed"><i data-lucide="calendar" class="mx-auto mb-2 opacity-20 w-12 h-12"></i>No competitions found in this year.</div>`}
                                     </div>
                                 </div>
                             ` : activeTab === 'records' ? `
@@ -1241,6 +1522,8 @@
                                     </h3>
                                     ${TimelineView(stats.timeline, selectedEvent)}
                                 </div>
+                            ` : activeTab === 'leaderboards' ? `
+                                ${LeaderboardView()}
                             ` : ''}
                         </div>
                     `}
