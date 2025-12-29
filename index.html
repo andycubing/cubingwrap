@@ -111,6 +111,9 @@
         };
         const getRoundPriority = (roundName) => ROUND_ORDER[roundName] !== undefined ? ROUND_ORDER[roundName] : 99;      
         
+        // Helper for strict final check to avoid "Semi Final" matching "Final"
+        const isFinalRound = (roundName) => roundName === "Final" || roundName === "Combined Final";
+
         // --- STATE MANAGEMENT ---
         let wcaId = WCA_ID_DEFAULT;
         let inputWcaId = WCA_ID_DEFAULT;
@@ -131,6 +134,7 @@
         let isGeneratingLeaderboard = false;
         let leaderboardProgress = 0;
         let leaderboardLimit = 20; 
+        let leaderboardPresetEvent = '333'; // New: Event for the "Preset" button
         let leaderboardSort = 'prs'; 
         
         // Selection Modal State
@@ -139,20 +143,30 @@
         let selectedTop200Ids = new Set();
         let loadingTop200 = false;
         let cachedNames = {}; // Store fetched names: { wcaId: "Name" }
+        let leaderboardEvent = '333'; // Default event for Top 200 list selection
 
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
             selectedYear, activeTab, viewMode, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
-            leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardSort,
-            showTop200Modal, top200List, selectedTop200Ids, loadingTop200, cachedNames
+            leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardPresetEvent, leaderboardSort,
+            showTop200Modal, top200List, selectedTop200Ids, loadingTop200, cachedNames, leaderboardEvent
         };
 
         let chartInstance = null; 
         let statsChartInstances = {};
 
+        // Custom setState with Scroll Preservation
         window.setState = (newState) => {
+            const currentScroll = window.scrollY; // Capture scroll
             Object.assign(window.state, newState);
             renderApp();
+            
+            // Restore scroll if it's a background update or modal interaction
+            if (newState.cachedNames || newState.leaderboardProgress || newState.loadingTop200 !== undefined || newState.top200List) {
+                window.scrollTo(0, currentScroll);
+            } else if (newState.viewMode && newState.viewMode !== window.state.viewMode) {
+                window.scrollTo(0, 0); // New view, scroll top
+            }
         };
 
         // --- UTILITY FUNCTIONS ---
@@ -223,9 +237,8 @@
                         roundsCount++;
                         if (roundData.solves) {
                             roundData.solves.forEach(s => {
-                                if (s > 0) attemptsCount++;
-                                if (s === -1) attemptsCount++;
-                                if (s > 0) solvesCount++;
+                                if (s > 0 || s === -1) attemptsCount++; // -1 is DNF (Attempted)
+                                if (s > 0) solvesCount++; // Only successful
                             });
                         }
                         results.push({
@@ -325,20 +338,20 @@
                         }
                     } catch (e) { console.error(e); }
                 }));
-                window.setState({ cachedNames: { ...cachedNames } });
+                // Use functional update to ensure fresh state, but setState handles scroll preservation
+                window.setState({ cachedNames: { ...window.state.cachedNames, ...cachedNames } });
                 await new Promise(r => setTimeout(r, 100)); // Gentle delay
             }
         };
 
-        const fetchTop200 = async () => {
-            if (window.state.top200List.length > 0) {
-                window.setState({ showTop200Modal: true });
-                return;
-            }
-            window.setState({ showTop200Modal: true, loadingTop200: true });
+        const fetchTop200 = async (eventId = window.state.leaderboardEvent) => {
+            // Keep existing list if switching events to allow multi-select
+            // But if we are re-opening, we might want to clear? No, user requested persistence.
+            window.setState({ showTop200Modal: true, loadingTop200: true, leaderboardEvent: eventId });
+            
             try {
-                // Fetch top 200 HK average 3x3 as base population
-                const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/333.json`);
+                // Fetch top 200 HK average for selected event
+                const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/${eventId}.json`);
                 if (!res.ok) throw new Error("Failed to fetch top list");
                 const data = await res.json();
                 const items = data.items.slice(0, 200);
@@ -356,7 +369,7 @@
         
         const fetchLeaderboard = async (mode = 'preset') => {
             // mode: 'preset', 'custom', 'selection'
-            const { leaderboardLimit, selectedYear, selectedTop200Ids } = window.state;
+            const { leaderboardLimit, leaderboardPresetEvent, selectedYear, selectedTop200Ids } = window.state;
             let customIds = [];
             
             if (mode === 'custom') {
@@ -378,13 +391,13 @@
                 } else if (mode === 'selection') {
                     targetIds = Array.from(selectedTop200Ids);
                     if (targetIds.length === 0) {
-                        alert("Please select at least one cuber.");
+                        alert("Please select at least one cuber from the list.");
                         window.setState({ isGeneratingLeaderboard: false });
                         return;
                     }
                 } else {
-                    // Preset: Top N HK
-                    const rankRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/333.json`);
+                    // Preset: Top N HK of specific event
+                    const rankRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/${leaderboardPresetEvent}.json`);
                     if (!rankRes.ok) throw new Error("Failed to fetch rankings");
                     const rankData = await rankRes.json();
                     targetIds = rankData.items.slice(0, leaderboardLimit).map(i => i.personId);
@@ -433,14 +446,15 @@
             
             let totalComps = comps.length;
             let totalSolves = 0;
+            let totalAttempts = 0;
             let medals = 0;
+            let overseasCount = 0;
             
             // PR Calculation
             const currentBest = {};
             EVENT_ORDER.forEach(e => currentBest[e] = { single: Infinity, average: Infinity });
             
             // Sort all comps historically for PR calc
-            // NOTE: Using ID sort as proxy for date when metadata isn't available
             const allHistoryComps = historyData.flatMap(y => y.competitions).sort((a,b) => {
                  const yA = extractYearFromId(a.id);
                  const yB = extractYearFromId(b.id);
@@ -453,8 +467,18 @@
                 const compYear = extractYearFromId(comp.id);
                 const isInFilter = isAllTime || compYear === targetYear;
                 
-                // IMPORTANT: Sort results by Round Priority to ensure PRs are processed chronologically
-                // e.g. First Round processed before Final.
+                // Count Overseas if metadata is available (best effort)
+                const meta = window.state.compMetadata[comp.id];
+                if (isInFilter && meta && !meta.error && meta.country && meta.country !== homeCountry) {
+                    overseasCount++;
+                }
+
+                if (isInFilter) {
+                    totalSolves += comp.solvesCount;
+                    totalAttempts += comp.attemptsCount;
+                }
+
+                // PR Logic
                 const sortedResults = [...comp.results].sort((a, b) => 
                     getRoundPriority(a.round) - getRoundPriority(b.round)
                 );
@@ -462,7 +486,6 @@
                 sortedResults.forEach(res => {
                     let isPR = false;
                     
-                    // Inequality check (<=) ensures ties are counted as PRs (per user request)
                     if (res.best > 0 && res.best <= currentBest[res.event].single) {
                         currentBest[res.event].single = res.best;
                         if (isInFilter) isPR = true;
@@ -475,19 +498,20 @@
                     if (isInFilter && isPR) prCount++;
                     
                     if (isInFilter) {
-                        // Medals (Finals only)
-                        if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                        // Medals (STRICT Finals only)
+                        if (isFinalRound(res.round) && res.place <= 3 && res.best > 0) {
                             medals++;
                         }
                     }
                 });
             });
             
-            comps.forEach(c => totalSolves += c.solvesCount);
-            
             return {
                 comps: totalComps,
                 solves: totalSolves,
+                attempts: totalAttempts,
+                dnf: totalAttempts - totalSolves,
+                overseas: overseasCount,
                 prs: prCount,
                 medals: medals,
                 podiumsPerComp: totalComps > 0 ? medals / totalComps : 0,
@@ -521,7 +545,8 @@
               return dateA.localeCompare(dateB) || a.id.localeCompare(b.id);
           });
       
-          const timeline = {};
+          const timeline = {}; // By Event
+          const flatTimeline = []; // All events sorted by date
           const currentBest = {};
           const prCounts = {}; 
           const prEvents = new Set(); 
@@ -547,7 +572,6 @@
                   let improved = false;
                   const entries = [];
       
-                  // Inequality check (<=) ensures ties are counted as PRs (per user request)
                   if (res.best > 0 && res.best <= currentBest[eventId].single) {
                       currentBest[eventId].single = res.best;
                       improved = true;
@@ -579,14 +603,21 @@
                   if (entries.length > 0) {
                       prEvents.add(`${comp.id}:${eventId}`);
                       entries.forEach(entry => {
-                          timeline[eventId].push({ ...entry, compName, date, round: res.round, compId: comp.id });
+                          const timelineItem = { ...entry, compName, date, round: res.round, compId: comp.id, eventId: eventId };
+                          timeline[eventId].push(timelineItem);
+                          flatTimeline.push(timelineItem);
                           prCounts[comp.id] = (prCounts[comp.id] || 0) + 1; 
                       });
                   }
               });
           });
+          
           Object.keys(timeline).forEach(k => timeline[k].length === 0 && delete timeline[k]);
-          return { timeline, prCounts, prEvents };
+          
+          // Sort flat timeline by date descending
+          flatTimeline.sort((a, b) => b.date.localeCompare(a.date));
+
+          return { timeline, flatTimeline, prCounts, prEvents };
         };
 
         const getAnnualStatistics = (historyData, prCounts) => {
@@ -618,7 +649,7 @@
                         yearPRs += (prCounts[comp.id] || 0);
 
                         comp.results.forEach(res => {
-                            if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                            if (isFinalRound(res.round) && res.place <= 3 && res.best > 0) {
                                 yearPodiums++;
                             }
                         });
@@ -666,7 +697,7 @@
                 }
         
                 comp.results.forEach(res => {
-                    if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                    if (isFinalRound(res.round) && res.place <= 3 && res.best > 0) {
                         if (res.place === 1) medals.gold++; 
                         else if (res.place === 2) medals.silver++; 
                         else if (res.place === 3) medals.bronze++; 
@@ -726,7 +757,7 @@
 
             statsComps.forEach(comp => {
                 comp.results.forEach(res => {
-                    if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
+                    if (isFinalRound(res.round) && res.place <= 3 && res.best > 0) {
                         if (!medalStats[res.event]) medalStats[res.event] = { gold: 0, silver: 0, bronze: 0, total: 0 };
                         if (res.place === 1) medalStats[res.event].gold++;
                         else if (res.place === 2) medalStats[res.event].silver++;
@@ -746,13 +777,13 @@
                     if (res.solves) {
                         res.solves.forEach(s => {
                             if (s > 0) yearSolveCounts[res.event]++;
-                            if (s !== 0) yearAttemptCounts[res.event]++;
+                            if (s > 0 || s === -1) yearAttemptCounts[res.event]++;
                         });
                     }
                 });
             });
 
-            const { timeline, prCounts, prEvents } = calculateTimelineAndCounts(historyData, compMetadata, isAllTime ? 'All Time' : selectedYear);
+            const { timeline, flatTimeline, prCounts, prEvents } = calculateTimelineAndCounts(historyData, compMetadata, isAllTime ? 'All Time' : selectedYear);
             
             const prsByComp = {};
             Object.keys(timeline).forEach(evt => {
@@ -770,7 +801,7 @@
             return {
                 ...currentStats, 
                 prevStats,
-                medalStats, sb, pb, timeline,
+                medalStats, sb, pb, timeline, flatTimeline,
                 solveCounts: yearSolveCounts,
                 attemptCounts: yearAttemptCounts,
                 statsComps,
@@ -1138,9 +1169,42 @@
             `;
         };
         
+        // --- SELECTED CUBERS LIST ---
+        const SelectedCubersList = () => {
+             const { selectedTop200Ids, cachedNames, top200List } = window.state;
+             if (selectedTop200Ids.size === 0) return '';
+             
+             const items = Array.from(selectedTop200Ids).map(id => {
+                 let name = cachedNames[id];
+                 if (!name) {
+                     // Try to find in current list
+                     const found = top200List.find(p => p.personId === id);
+                     if (found) name = found.personName;
+                     else name = id;
+                 }
+                 
+                 return `
+                    <div class="flex items-center gap-2 bg-indigo-900/40 border border-indigo-500/30 text-indigo-200 px-3 py-1.5 rounded-full text-sm">
+                        <span>${name}</span>
+                        <button onclick="window.toggleTop200Selection('${id}')" class="hover:text-white transition-colors"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
+                    </div>
+                 `;
+             }).join('');
+             
+             return `
+                <div class="mt-4 animate-fade-in-up">
+                    <label class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2 block">Selected Cubers</label>
+                    <div class="flex flex-wrap gap-2">
+                        ${items}
+                        <button onclick="window.setState({ selectedTop200Ids: new Set() })" class="text-xs text-red-400 hover:text-red-300 underline py-1.5 px-2">Clear All</button>
+                    </div>
+                </div>
+             `;
+        };
+
         // --- LEADERBOARD VIEW ---
         const LeaderboardView = () => {
-             const { leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardSort, selectedYear } = window.state;
+             const { leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardSort, selectedYear, leaderboardPresetEvent } = window.state;
              
              let sortedData = [...leaderboardData];
              if (leaderboardSort) {
@@ -1151,6 +1215,8 @@
              const years = [];
              for(let y = currentYear; y >= 2000; y--) years.push(y);
              
+             const eventOptions = EVENT_ORDER.map(e => `<option value="${e}" ${leaderboardPresetEvent === e ? 'selected' : ''}>${getEventInfo(e).name}</option>`).join('');
+
              const renderRow = (item, index) => `
                 <tr class="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
                     <td class="px-4 py-3 font-mono text-slate-500 w-12 text-center">#${index + 1}</td>
@@ -1166,12 +1232,14 @@
                         </div>
                     </td>
                     <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'comps' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.comps}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'overseas' ? 'text-indigo-400' : 'text-slate-400'}">${item.stats.overseas === 0 ? '-' : item.stats.overseas}</td>
                     <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'solves' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.solves}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'solvesPerComp' ? 'text-indigo-400' : 'text-slate-400'}">${item.stats.solvesPerComp.toFixed(1)}</td>
+                    <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'dnf' ? 'text-indigo-400' : 'text-slate-400'}">${item.stats.dnf}</td>
                     <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'prs' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.prs}</td>
                     <td class="px-4 py-3 text-right font-mono font-bold ${leaderboardSort === 'medals' ? 'text-indigo-400' : 'text-slate-300'}">${item.stats.medals}</td>
                     <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'podiumsPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.podiumsPerComp.toFixed(2)}</td>
                     <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'prsPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.prsPerComp.toFixed(2)}</td>
-                    <td class="px-4 py-3 text-right font-mono text-sm ${leaderboardSort === 'solvesPerComp' ? 'text-indigo-400 font-bold' : 'text-slate-400'}">${item.stats.solvesPerComp.toFixed(2)}</td>
                 </tr>
              `;
              
@@ -1186,31 +1254,42 @@
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                             <!-- Preset Column -->
                             <div class="space-y-3">
-                                <label class="text-sm font-medium text-slate-400">Preset: Top HK 3x3 Average</label>
+                                <label class="text-sm font-medium text-slate-400">Preset: Top HK Cubers</label>
                                 <div class="flex flex-wrap gap-2">
+                                     <select onchange="window.setState({ leaderboardPresetEvent: this.value })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 max-w-[120px]">
+                                        ${eventOptions}
+                                    </select>
                                     <select id="leaderboardLimitSelect" onchange="window.setState({ leaderboardLimit: parseInt(this.value) })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5">
                                         <option value="10" ${window.state.leaderboardLimit === 10 ? 'selected' : ''}>Top 10</option>
                                         <option value="20" ${window.state.leaderboardLimit === 20 ? 'selected' : ''}>Top 20</option>
                                         <option value="50" ${window.state.leaderboardLimit === 50 ? 'selected' : ''}>Top 50</option>
+                                        <option value="100" ${window.state.leaderboardLimit === 100 ? 'selected' : ''}>Top 100</option>
                                     </select>
                                     <button onclick="fetchLeaderboard('preset')" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
-                                        Load Preset
-                                    </button>
-                                    <button onclick="fetchTop200()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap flex items-center gap-2">
-                                        <i data-lucide="list-plus" class="w-4 h-4"></i> Select from Top 200
+                                        Load Rankings
                                     </button>
                                 </div>
                             </div>
 
                             <!-- Custom Column -->
                             <div class="space-y-3">
-                                <label class="text-sm font-medium text-slate-400">Custom: Compare Specific WCA IDs</label>
+                                <label class="text-sm font-medium text-slate-400">Custom / Selection</label>
                                 <div class="flex gap-2">
-                                    <input type="text" id="customLeaderboardIds" placeholder="2017KWAN05, 2015LEON02..." class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block w-full p-2.5">
+                                    <button onclick="fetchTop200()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap flex items-center gap-2">
+                                        <i data-lucide="list-plus" class="w-4 h-4"></i> Select Cubers
+                                    </button>
+                                    <div class="h-auto w-px bg-slate-700 mx-1"></div>
+                                    <input type="text" id="customLeaderboardIds" placeholder="Or enter IDs manually..." class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block w-full p-2.5">
                                     <button onclick="fetchLeaderboard('custom')" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
-                                        Compare IDs
+                                        Go
                                     </button>
                                 </div>
+                                ${SelectedCubersList()}
+                                ${window.state.selectedTop200Ids.size > 0 ? `
+                                    <button onclick="fetchLeaderboard('selection')" class="w-full mt-2 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-lg transition-colors">
+                                        Generate from Selection (${window.state.selectedTop200Ids.size})
+                                    </button>
+                                ` : ''}
                             </div>
                         </div>
 
@@ -1233,12 +1312,14 @@
                                         <th class="px-4 py-3 text-center">#</th>
                                         <th class="px-4 py-3">Cuber</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'comps' })">Comps ${leaderboardSort === 'comps' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'overseas' })">Overseas ${leaderboardSort === 'overseas' ? '↓' : ''}</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'solves' })">Solves ${leaderboardSort === 'solves' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'solvesPerComp' })">Solves/Comp ${leaderboardSort === 'solvesPerComp' ? '↓' : ''}</th>
+                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'dnf' })">DNF ${leaderboardSort === 'dnf' ? '↓' : ''}</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'prs' })">PRs ${leaderboardSort === 'prs' ? '↓' : ''}</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'medals' })">Medals ${leaderboardSort === 'medals' ? '↓' : ''}</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'podiumsPerComp' })">Podium Rate ${leaderboardSort === 'podiumsPerComp' ? '↓' : ''}</th>
                                         <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'prsPerComp' })">PR Rate ${leaderboardSort === 'prsPerComp' ? '↓' : ''}</th>
-                                        <th class="px-4 py-3 text-right cursor-pointer hover:text-white" onclick="window.setState({ leaderboardSort: 'solvesPerComp' })">Solves/Comp ${leaderboardSort === 'solvesPerComp' ? '↓' : ''}</th>
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800 text-sm">
@@ -1256,7 +1337,7 @@
                     ` : `
                         <div class="py-20 text-center text-slate-500 border border-slate-800 rounded-xl border-dashed">
                             <i data-lucide="bar-chart-big" class="mx-auto mb-3 opacity-20 w-12 h-12"></i>
-                            <p>Click "Load Preset" or "Compare IDs" to generate data.</p>
+                            <p>Select options above to generate a leaderboard.</p>
                         </div>
                     `}
                 </div>
@@ -1267,26 +1348,21 @@
         const Top200Modal = () => {
             if (!window.state.showTop200Modal) return '';
             
-            const { top200List, selectedTop200Ids, loadingTop200 } = window.state;
+            const { top200List, selectedTop200Ids, loadingTop200, leaderboardEvent } = window.state;
             
-            const toggleSelection = (id) => {
-                const newSet = new Set(selectedTop200Ids);
-                if (newSet.has(id)) newSet.delete(id);
-                else {
-                    if (newSet.size >= 20) {
-                        alert("Please select max 20 cubers to avoid API rate limits.");
-                        return;
-                    }
-                    newSet.add(id);
-                }
-                window.setState({ selectedTop200Ids: newSet });
-            };
-            
+            // Generate options for the dropdown
+            const eventOptions = EVENT_ORDER.map(e => `<option value="${e}" ${leaderboardEvent === e ? 'selected' : ''}>${getEventInfo(e).name}</option>`).join('');
+
             return `
                 <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
                     <div class="bg-slate-900 w-full max-w-2xl rounded-xl border border-slate-700 shadow-2xl flex flex-col max-h-[80vh]">
-                        <div class="p-4 border-b border-slate-800 flex justify-between items-center">
-                            <h3 class="text-lg font-bold text-white">Select from Top 200 (HK 3x3 Average)</h3>
+                        <div class="p-4 border-b border-slate-800 flex justify-between items-center gap-4">
+                            <div class="flex items-center gap-2 flex-1">
+                                <h3 class="text-lg font-bold text-white whitespace-nowrap">Add to Selection</h3>
+                                <select onchange="fetchTop200(this.value)" class="bg-slate-800 border border-slate-600 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-1.5 ml-2">
+                                    ${eventOptions}
+                                </select>
+                            </div>
                             <button onclick="window.setState({ showTop200Modal: false })" class="text-slate-400 hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
                         </div>
                         <div class="p-4 flex-1 overflow-y-auto no-scrollbar">
@@ -1313,7 +1389,7 @@
                                                 <div class="text-sm font-medium text-white">${name}</div>
                                                 <div class="text-xs text-slate-500 font-mono flex gap-2">
                                                     <span>${p.personId}</span>
-                                                    <span class="text-indigo-400 font-bold">${(p.best/100).toFixed(2)}</span>
+                                                    <span class="text-indigo-400 font-bold">${formatResult(p.best, leaderboardEvent, 'average')}</span>
                                                 </div>
                                             </div>
                                         </div>
@@ -1322,9 +1398,9 @@
                             `}
                         </div>
                         <div class="p-4 border-t border-slate-800 flex justify-between items-center bg-slate-900 rounded-b-xl">
-                            <span class="text-sm text-slate-400">${selectedTop200Ids.size} selected (Max 20)</span>
+                            <span class="text-sm text-slate-400">${selectedTop200Ids.size} selected</span>
                             <div class="flex gap-2">
-                                <button onclick="window.setState({ showTop200Modal: false })" class="px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-white">Cancel</button>
+                                <button onclick="window.setState({ showTop200Modal: false })" class="px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-white">Close</button>
                                 <button onclick="window.setState({ showTop200Modal: false }); fetchLeaderboard('selection');" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-lg transition-colors shadow-lg shadow-indigo-500/20">
                                     Generate Leaderboard
                                 </button>
@@ -1341,10 +1417,6 @@
              const newSet = new Set(selectedTop200Ids);
             if (newSet.has(id)) newSet.delete(id);
             else {
-                if (newSet.size >= 20) {
-                    alert("Please select max 20 cubers to avoid API rate limits.");
-                    return;
-                }
                 newSet.add(id);
             }
             window.setState({ selectedTop200Ids: newSet });
@@ -1366,7 +1438,7 @@
 
             const eventResultsHtml = Array.from(eventsMap.entries())
                 .filter(([event, rounds]) => {
-                    return rounds.some(r => r.round.includes("Final") && r.place <= 3 && r.best > 0);
+                    return rounds.some(r => isFinalRound(r.round) && r.place <= 3 && r.best > 0);
                 })
                 .sort(([a], [b]) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b))
                 .map(([event, rounds]) => {
@@ -1377,15 +1449,16 @@
                         let placeClass = 'text-slate-400 border-slate-700/50';
                         let iconHtml = '';
                         
-                        const isFinalRound = res.round.includes("Final"); 
+                        // Strict Final Check
+                        const isFinal = isFinalRound(res.round);
                         
-                        if (res.place === 1 && res.best > 0 && isFinalRound) {
+                        if (res.place === 1 && res.best > 0 && isFinal) {
                             placeClass = 'text-yellow-400 bg-yellow-900/20 border-yellow-500/30 font-bold';
                             iconHtml = '<i data-lucide="award" class="w-3 h-3 text-yellow-400 mr-1 shrink-0"></i>';
-                        } else if (res.place === 2 && res.best > 0 && isFinalRound) {
+                        } else if (res.place === 2 && res.best > 0 && isFinal) {
                             placeClass = 'text-gray-400 bg-gray-700/20 border-gray-400/30 font-bold';
                             iconHtml = '<i data-lucide="award" class="w-3 h-3 text-gray-400 mr-1 shrink-0"></i>';
-                        } else if (res.place === 3 && res.best > 0 && isFinalRound) {
+                        } else if (res.place === 3 && res.best > 0 && isFinal) {
                             placeClass = 'text-amber-700 bg-amber-900/20 border-amber-700/30 font-bold';
                             iconHtml = '<i data-lucide="award" class="w-3 h-3 text-amber-700 mr-1 shrink-0"></i>';
                         }
@@ -1502,10 +1575,59 @@
             return `<div class="mb-12"><div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">${items}</div></div>`;
         };
         
-        const TimelineView = (timeline, selectedEvent) => {
+        const TimelineView = (timeline, flatTimeline, selectedEvent) => {
              const keys = Object.keys(timeline).sort((a, b) => EVENT_ORDER.indexOf(a) - EVENT_ORDER.indexOf(b));
              const filteredKeys = selectedEvent ? keys.filter(k => k === selectedEvent) : keys;
              
+             if (!selectedEvent) {
+                // Unified View
+                if(flatTimeline.length === 0) return `<div class="p-10 text-center text-slate-500 border border-slate-800 rounded-xl border-dashed">No record updates available.</div>`;
+
+                const rows = flatTimeline.map(rec => {
+                    const eventInfo = getEventInfo(rec.eventId);
+                    return `
+                    <tr class="hover:bg-slate-800/50 transition-colors border-l-2 ${rec.type === 'Average' ? 'border-indigo-500' : 'border-emerald-500'}">
+                            <td class="px-4 py-3 text-slate-300 text-xs whitespace-nowrap">${rec.date}</td>
+                            <td class="px-4 py-3 font-medium text-white flex items-center gap-2">
+                                <div class="w-1.5 h-1.5 rounded-full ${eventInfo.bg}"></div>
+                                ${eventInfo.name}
+                            </td>
+                            <td class="px-4 py-3 text-white font-medium">
+                            ${rec.compName}
+                            <div class="text-xs text-slate-500 font-normal">${rec.round}</div>
+                            </td>
+                            <td class="px-4 py-3">
+                            <span class="px-2 py-0.5 rounded text-xs font-bold ${rec.type === 'Average' ? 'bg-indigo-900/50 text-indigo-300' : 'bg-emerald-900/50 text-emerald-300'}">
+                                ${rec.type}
+                            </span>
+                            </td>
+                            <td class="px-4 py-3 font-mono font-bold text-white whitespace-nowrap">
+                            ${rec.formattedResult}
+                            ${rec.details ? `<div class="text-xs text-slate-500 font-normal mt-0.5">${rec.details}</div>` : ''}
+                            </td>
+                    </tr>
+                `}).join('');
+
+                 return `
+                    <div class="mb-8">
+                         <div class="overflow-x-auto rounded-lg border border-slate-800">
+                                <table class="w-full text-left bg-slate-900">
+                                    <thead class="bg-slate-950 text-slate-400 text-xs uppercase font-semibold">
+                                        <tr>
+                                            <th class="px-4 py-2 w-24">Date</th>
+                                            <th class="px-4 py-2">Event</th>
+                                            <th class="px-4 py-2">Competition</th>
+                                            <th class="px-4 py-2 w-20">Type</th>
+                                            <th class="px-4 py-2">Result</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-slate-800 text-sm">${rows}</tbody>
+                                </table>
+                        </div>
+                    </div>
+                 `;
+             }
+
              if (filteredKeys.length === 0) return `<div class="p-10 text-center text-slate-500 border border-slate-800 rounded-xl border-dashed">No record updates for the selected criteria.</div>`;
 
              const sections = filteredKeys.map(event => {
@@ -1676,6 +1798,9 @@
                                         
                                         ${selectedEvent ? `
                                             <div class="mb-10 animate-fade-in-up">
+                                                <button onclick="window.setState({ selectedEvent: null })" class="mb-4 text-xs font-bold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 transition-colors">
+                                                    <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to Overall
+                                                </button>
                                                 <div class="flex items-center justify-between mb-4">
                                                     <h3 class="text-xl font-bold text-white flex items-center gap-2">
                                                         <i data-lucide="line-chart" class="text-indigo-400 w-5 h-5"></i> 
@@ -1691,9 +1816,9 @@
 
                                         <h3 id="record-timeline" class="text-2xl font-bold text-white mb-8 flex items-center gap-2">
                                             <i data-lucide="trending-up" class="text-emerald-400 w-6 h-6"></i>
-                                            ${selectedEvent ? `${getEventInfo(selectedEvent).name} Record Timeline` : 'Record Timeline'}
+                                            ${selectedEvent ? `${getEventInfo(selectedEvent).name} Record Timeline` : 'Overall Combined Record Timeline'}
                                         </h3>
-                                        ${TimelineView(stats.timeline, selectedEvent)}
+                                        ${TimelineView(stats.timeline, stats.flatTimeline, selectedEvent)}
                                     </div>
                                 ` : ''}
                             </div>
