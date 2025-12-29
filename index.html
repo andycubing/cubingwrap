@@ -38,6 +38,15 @@
         body { font-family: 'Inter', sans-serif; }
         .no-scrollbar::-webkit-scrollbar { display: none; }
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        
+        /* Checkbox Styles */
+        .checkbox-wrapper input:checked + div {
+            background-color: #4f46e5;
+            border-color: #4f46e5;
+        }
+        .checkbox-wrapper input:checked + div svg {
+            display: block;
+        }
     </style>
 </head>
 <body class="min-h-screen bg-slate-900 text-slate-200">
@@ -90,14 +99,17 @@
         };
         
         const getEventInfo = (eventId) => EVENT_MAP[eventId] || { name: eventId, color: "text-gray-400", bg: "bg-gray-400" };
+        
         const ROUND_ORDER = {
+            "Qualification round": 0,
             "First round": 1,
             "Combined First round": 1,
             "Second round": 2,
             "Semi Final": 3,
             "Final": 4,
-            "Combined Final": 4};
-        const getRoundPriority = (roundName) => ROUND_ORDER[roundName] || 99;      
+            "Combined Final": 4
+        };
+        const getRoundPriority = (roundName) => ROUND_ORDER[roundName] !== undefined ? ROUND_ORDER[roundName] : 99;      
         
         // --- STATE MANAGEMENT ---
         let wcaId = WCA_ID_DEFAULT;
@@ -118,17 +130,24 @@
         let leaderboardData = [];
         let isGeneratingLeaderboard = false;
         let leaderboardProgress = 0;
-        let leaderboardLimit = 20; // Default limit
-        let leaderboardSort = 'prs'; // default sort
+        let leaderboardLimit = 20; 
+        let leaderboardSort = 'prs'; 
+        
+        // Selection Modal State
+        let showTop200Modal = false;
+        let top200List = [];
+        let selectedTop200Ids = new Set();
+        let loadingTop200 = false;
+        let cachedNames = {}; // Store fetched names: { wcaId: "Name" }
 
         window.state = { 
             wcaId, inputWcaId, userData, historyData, loading, error, 
             selectedYear, activeTab, viewMode, compMetadata, loadingMetadata, metadataFetchInProgress, selectedEvent,
-            leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardSort
+            leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardLimit, leaderboardSort,
+            showTop200Modal, top200List, selectedTop200Ids, loadingTop200, cachedNames
         };
 
         let chartInstance = null; 
-        // Store instances for stats charts
         let statsChartInstances = {};
 
         window.setState = (newState) => {
@@ -286,15 +305,61 @@
                 window.setState({ loading: false });
             }
         };
+
+        const fetchNamesBackground = async (items) => {
+            const { cachedNames } = window.state;
+            const missing = items.filter(i => !cachedNames[i.personId]);
+            if (missing.length === 0) return;
+
+            // Fetch in chunks to avoid rate limits
+            const chunkSize = 5;
+            for (let i = 0; i < missing.length; i += chunkSize) {
+                if (!window.state.showTop200Modal) break; // Stop if modal closed
+                const chunk = missing.slice(i, i + chunkSize);
+                await Promise.all(chunk.map(async (item) => {
+                    try {
+                        const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/persons/${item.personId}.json`);
+                        if (res.ok) {
+                            const data = await res.json();
+                            cachedNames[item.personId] = data.name;
+                        }
+                    } catch (e) { console.error(e); }
+                }));
+                window.setState({ cachedNames: { ...cachedNames } });
+                await new Promise(r => setTimeout(r, 100)); // Gentle delay
+            }
+        };
+
+        const fetchTop200 = async () => {
+            if (window.state.top200List.length > 0) {
+                window.setState({ showTop200Modal: true });
+                return;
+            }
+            window.setState({ showTop200Modal: true, loadingTop200: true });
+            try {
+                // Fetch top 200 HK average 3x3 as base population
+                const res = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/333.json`);
+                if (!res.ok) throw new Error("Failed to fetch top list");
+                const data = await res.json();
+                const items = data.items.slice(0, 200);
+                window.setState({ top200List: items, loadingTop200: false });
+                
+                // Trigger background fetch for names
+                fetchNamesBackground(items);
+            } catch (e) {
+                alert("Error fetching top list: " + e.message);
+                window.setState({ showTop200Modal: false, loadingTop200: false });
+            }
+        };
         
         // --- LEADERBOARD LOGIC ---
         
-        const fetchLeaderboard = async (useCustom = false) => {
-            const { leaderboardLimit, selectedYear } = window.state;
+        const fetchLeaderboard = async (mode = 'preset') => {
+            // mode: 'preset', 'custom', 'selection'
+            const { leaderboardLimit, selectedYear, selectedTop200Ids } = window.state;
             let customIds = [];
             
-            // Handle Custom ID input
-            if (useCustom) {
+            if (mode === 'custom') {
                 const inputVal = document.getElementById('customLeaderboardIds').value;
                 if (!inputVal || !inputVal.trim()) {
                     alert("Please enter at least one WCA ID.");
@@ -308,22 +373,26 @@
             try {
                 let targetIds = [];
                 
-                if (useCustom) {
+                if (mode === 'custom') {
                     targetIds = customIds;
+                } else if (mode === 'selection') {
+                    targetIds = Array.from(selectedTop200Ids);
+                    if (targetIds.length === 0) {
+                        alert("Please select at least one cuber.");
+                        window.setState({ isGeneratingLeaderboard: false });
+                        return;
+                    }
                 } else {
-                    // 1. Fetch Ranking List (Base HK 3x3 Average as proxy for active cubers)
+                    // Preset: Top N HK
                     const rankRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/rank/HK/average/333.json`);
                     if (!rankRes.ok) throw new Error("Failed to fetch rankings");
                     const rankData = await rankRes.json();
-                    
-                    // 2. Slice top N items
                     targetIds = rankData.items.slice(0, leaderboardLimit).map(i => i.personId);
                 }
                 
                 const results = [];
                 let processed = 0;
                 
-                // 3. Process each cuber
                 for (const wcaId of targetIds) {
                     try {
                         const personRes = await fetch(`https://raw.githubusercontent.com/robiningelbrecht/wca-rest-api/master/api/persons/${wcaId}.json`);
@@ -365,14 +434,13 @@
             let totalComps = comps.length;
             let totalSolves = 0;
             let medals = 0;
-            let countries = new Set();
-            let overseas = 0;
             
             // PR Calculation
             const currentBest = {};
             EVENT_ORDER.forEach(e => currentBest[e] = { single: Infinity, average: Infinity });
             
             // Sort all comps historically for PR calc
+            // NOTE: Using ID sort as proxy for date when metadata isn't available
             const allHistoryComps = historyData.flatMap(y => y.competitions).sort((a,b) => {
                  const yA = extractYearFromId(a.id);
                  const yB = extractYearFromId(b.id);
@@ -385,13 +453,21 @@
                 const compYear = extractYearFromId(comp.id);
                 const isInFilter = isAllTime || compYear === targetYear;
                 
-                comp.results.forEach(res => {
+                // IMPORTANT: Sort results by Round Priority to ensure PRs are processed chronologically
+                // e.g. First Round processed before Final.
+                const sortedResults = [...comp.results].sort((a, b) => 
+                    getRoundPriority(a.round) - getRoundPriority(b.round)
+                );
+
+                sortedResults.forEach(res => {
                     let isPR = false;
-                    if (res.best > 0 && res.best < currentBest[res.event].single) {
+                    
+                    // Inequality check (<=) ensures ties are counted as PRs (per user request)
+                    if (res.best > 0 && res.best <= currentBest[res.event].single) {
                         currentBest[res.event].single = res.best;
                         if (isInFilter) isPR = true;
                     }
-                    if (res.event !== '333mbf' && res.average > 0 && res.average < currentBest[res.event].average) {
+                    if (res.event !== '333mbf' && res.average > 0 && res.average <= currentBest[res.event].average) {
                         currentBest[res.event].average = res.average;
                         if (isInFilter) isPR = true;
                     }
@@ -399,7 +475,7 @@
                     if (isInFilter && isPR) prCount++;
                     
                     if (isInFilter) {
-                         // Medals (Finals only)
+                        // Medals (Finals only)
                         if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                             medals++;
                         }
@@ -447,8 +523,8 @@
       
           const timeline = {};
           const currentBest = {};
-          const prCounts = {}; // Track PRs per competition
-          const prEvents = new Set(); // Track specific events in comps that had PRs: "compId:eventId"
+          const prCounts = {}; 
+          const prEvents = new Set(); 
           
           EVENT_ORDER.forEach(e => {
               timeline[e] = [];
@@ -471,7 +547,8 @@
                   let improved = false;
                   const entries = [];
       
-                  if (res.best > 0 && res.best < currentBest[eventId].single) {
+                  // Inequality check (<=) ensures ties are counted as PRs (per user request)
+                  if (res.best > 0 && res.best <= currentBest[eventId].single) {
                       currentBest[eventId].single = res.best;
                       improved = true;
                       if (isAllTime || year === maxYear) {
@@ -483,7 +560,7 @@
                       }
                   }
       
-                  if (eventId !== '333mbf' && res.average > 0 && res.average < currentBest[eventId].average) {
+                  if (eventId !== '333mbf' && res.average > 0 && res.average <= currentBest[eventId].average) {
                       currentBest[eventId].average = res.average;
                       improved = true;
                       if (isAllTime || year === maxYear) {
@@ -502,7 +579,6 @@
                   if (entries.length > 0) {
                       prEvents.add(`${comp.id}:${eventId}`);
                       entries.forEach(entry => {
-                          // ADDED: compId to track where the PR happened
                           timeline[eventId].push({ ...entry, compName, date, round: res.round, compId: comp.id });
                           prCounts[comp.id] = (prCounts[comp.id] || 0) + 1; 
                       });
@@ -516,16 +592,13 @@
         const getAnnualStatistics = (historyData, prCounts) => {
             if (!historyData || historyData.length === 0) return [];
 
-            // 1. Find Year Range
             const years = historyData.map(d => d.year);
             const minYear = Math.min(...years);
             const currentYear = new Date().getFullYear();
             const maxYear = Math.max(currentYear, ...years);
 
-            // 2. Create Map for quick lookup
             const dataMap = new Map(historyData.map(d => [d.year, d]));
 
-            // 3. Generate Range (Descending: Latest -> Earliest)
             const stats = [];
             
             for (let year = maxYear; year >= minYear; year--) {
@@ -545,7 +618,6 @@
                         yearPRs += (prCounts[comp.id] || 0);
 
                         comp.results.forEach(res => {
-                            // Count podiums for Final rounds only
                             if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                                 yearPodiums++;
                             }
@@ -569,12 +641,10 @@
             return stats;
         };
 
-        // Aggregates stats for a specific year (or All Time)
         const getStatsForYear = (yearStr, historyData, compMetadata, userData) => {
             const isAllTime = yearStr === 'All Time';
             const targetYear = isAllTime ? null : parseInt(yearStr);
 
-            // Filter competitions
             const comps = isAllTime 
                 ? historyData.flatMap(y => y.competitions) 
                 : historyData.filter(y => y.year === targetYear).flatMap(y => y.competitions);
@@ -596,7 +666,6 @@
                 }
         
                 comp.results.forEach(res => {
-                    // Only count medals for Final rounds, as this is the standard WCA definition
                     if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                         if (res.place === 1) medals.gold++; 
                         else if (res.place === 2) medals.silver++; 
@@ -616,10 +685,8 @@
             const { selectedYear, historyData, compMetadata, userData } = state;
             const isAllTime = selectedYear === 'All Time';
             
-            // 1. Current Stats
             const currentStats = getStatsForYear(selectedYear, historyData, compMetadata, userData);
 
-            // 2. Previous Year Stats (for comparisons)
             let prevStats = null;
             let prevTotalPRs = null;
 
@@ -627,13 +694,11 @@
                 const prevYear = (parseInt(selectedYear) - 1).toString();
                 prevStats = getStatsForYear(prevYear, historyData, compMetadata, userData);
                 
-                // Calculate PRs for previous year to allow trend comparison
                 const { timeline: prevTimeline } = calculateTimelineAndCounts(historyData, compMetadata, prevYear);
                 prevTotalPRs = 0;
                 Object.values(prevTimeline).forEach(arr => prevTotalPRs += arr.length);
             }
 
-            // 3. Detailed breakdows (Medals, PBs) require specific object structures
             const statsComps = isAllTime 
                 ? historyData.flatMap(y => y.competitions) 
                 : historyData.filter(y => y.year === parseInt(selectedYear)).flatMap(y => y.competitions);
@@ -659,10 +724,8 @@
                 });
             });
 
-            // SB and Detailed Medals
             statsComps.forEach(comp => {
                 comp.results.forEach(res => {
-                    // Only count medals for Final rounds (WCA medal definition)
                     if (res.round.includes("Final") && res.place <= 3 && res.best > 0) {
                         if (!medalStats[res.event]) medalStats[res.event] = { gold: 0, silver: 0, bronze: 0, total: 0 };
                         if (res.place === 1) medalStats[res.event].gold++;
@@ -675,7 +738,6 @@
                 });
             });
 
-            // Counts
             const yearSolveCounts = {};
             const yearAttemptCounts = {};
             EVENT_ORDER.forEach(e => { yearSolveCounts[e] = 0; yearAttemptCounts[e] = 0; });
@@ -690,10 +752,8 @@
                 });
             });
 
-            // Timeline and PR Counts
             const { timeline, prCounts, prEvents } = calculateTimelineAndCounts(historyData, compMetadata, isAllTime ? 'All Time' : selectedYear);
             
-            // NEW: Group PRs by Competition ID for easy display
             const prsByComp = {};
             Object.keys(timeline).forEach(evt => {
                 timeline[evt].forEach(entry => {
@@ -705,22 +765,21 @@
             let totalPRs = 0;
             Object.values(timeline).forEach(arr => totalPRs += arr.length);
 
-            // Annual Statistics for Graphs (Only relevant for All Time view, but good to have)
             const annualStats = isAllTime ? getAnnualStatistics(historyData, prCounts) : [];
 
             return {
-                ...currentStats, // totalComps, totalSolves etc.
-                prevStats,       // The comparison object
+                ...currentStats, 
+                prevStats,
                 medalStats, sb, pb, timeline,
                 solveCounts: yearSolveCounts,
                 attemptCounts: yearAttemptCounts,
                 statsComps,
-                prCounts, // Map of CompID -> Number of PRs
-                prsByComp, // NEW: Map of CompID -> Array of PR Details
-                prEvents, // Set of strings "compId:eventId"
-                totalPRs, // Sum of PRs in current period
-                prevTotalPRs, // Sum of PRs in previous period (for trend)
-                annualStats // Array of stats per year
+                prCounts, 
+                prsByComp, 
+                prEvents, 
+                totalPRs, 
+                prevTotalPRs, 
+                annualStats 
             };
         };
 
@@ -729,17 +788,15 @@
             if (!ctx) return;
             if (chartInstance) chartInstance.destroy();
 
-            // 1. Sort competitions by Date ASCENDING (Oldest first)
             const sortedComps = [...comps].sort((a, b) => {
                 const dateA = window.state.compMetadata[a.id]?.date?.from || a.id;
                 const dateB = window.state.compMetadata[b.id]?.date?.from || b.id;
-                return dateA.localeCompare(dateB); // Ascending
+                return dateA.localeCompare(dateB); 
             });
 
             const dataPoints = [];
             sortedComps.forEach(comp => {
                 const eventResults = comp.results.filter(r => r.event === eventId);
-                // Sort rounds: First Round -> Final
                 eventResults.sort((a,b) => getRoundPriority(a.round) - getRoundPriority(b.round));
                 
                 eventResults.forEach(res => {
@@ -761,7 +818,6 @@
 
             if (dataPoints.length === 0) return;
             
-            // 2. Trendline (Linear Regression)
             const n = dataPoints.length;
             let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
             dataPoints.forEach((p, i) => {
@@ -779,18 +835,16 @@
             
             dataPoints.forEach((point, i) => {
                 sumSoFar += point.y;
-                runningMeanData.push(sumSoFar / (i + 1));  // average of all solves up to this point
+                runningMeanData.push(sumSoFar / (i + 1)); 
             });
             
-            // 3. Running Mean (Moving Average of 5)
             const movingAvgData = dataPoints.map((_, i, arr) => {
-                if (i < 4) return null; // Need 5 points
+                if (i < 4) return null; 
                 const subset = arr.slice(i - 4, i + 1);
                 const sum = subset.reduce((acc, curr) => acc + curr.y, 0);
                 return sum / 5;
             });
 
-            // 4. Calculate Scale Max (Outlier Filtering)
             const sortedValues = dataPoints.map(p => p.y).sort((a, b) => a - b);
             const p95Index = Math.floor(sortedValues.length * 0.95);
             const p95Value = sortedValues[p95Index];
@@ -876,7 +930,7 @@
                             grid: { color: '#334155' },
                             ticks: { color: '#94a3b8' },
                             title: { display: true, text: eventId === '333fm' ? 'Moves' : 'Seconds', color: '#64748b' },
-                            suggestedMax: suggestedMax // Caps the view at P95 approx
+                            suggestedMax: suggestedMax
                         },
                         x: { display: false }
                     }
@@ -885,7 +939,6 @@
         };
 
         const renderStatsCharts = (annualStats) => {
-            // Helper to clean up chart instances
             const destroyChart = (id) => {
                 if (statsChartInstances[id]) {
                     statsChartInstances[id].destroy();
@@ -906,7 +959,6 @@
                 }
             };
 
-            // 1. Solves & Attempts
             const ctx1 = document.getElementById('chartSolvesAttempts');
             if (ctx1) {
                 destroyChart('solvesAttempts');
@@ -923,7 +975,6 @@
                 });
             }
 
-            // 2. Competitions
             const ctx2 = document.getElementById('chartComps');
             if (ctx2) {
                 destroyChart('comps');
@@ -934,7 +985,6 @@
                 });
             }
 
-            // 3. Podiums
             const ctx3 = document.getElementById('chartPodiums');
             if (ctx3) {
                 destroyChart('podiums');
@@ -945,7 +995,6 @@
                 });
             }
 
-            // 4. PRs
             const ctx4 = document.getElementById('chartPRs');
             if (ctx4) {
                 destroyChart('prs');
@@ -956,7 +1005,6 @@
                 });
             }
 
-            // 5. Podiums per Comp
             const ctx5 = document.getElementById('chartPodiumsRate');
             if (ctx5) {
                 destroyChart('podiumsRate');
@@ -967,7 +1015,6 @@
                 });
             }
 
-            // 6. PRs per Comp
             const ctx6 = document.getElementById('chartPRsRate');
             if (ctx6) {
                 destroyChart('prsRate');
@@ -978,7 +1025,6 @@
                 });
             }
 
-            // 7. Solves per Comp
             const ctx7 = document.getElementById('chartSolvesRate');
             if (ctx7) {
                 destroyChart('solvesRate');
@@ -993,7 +1039,6 @@
         // --- RENDERING COMPONENTS ---
 
         const TrendIndicator = (current, previous) => {
-            // If no previous data (e.g. All Time selected, or no previous year data), show nothing or a dash
             if (previous === undefined || previous === null) {
                  return `<span class="text-slate-500 ml-2 text-xs"></span>`;
             }
@@ -1026,7 +1071,7 @@
                 let total = 0;
                 let rows = annualStats.map(s => {
                    const val = mapper(s);
-                   if (typeof val === 'number' && !Number.isInteger(val)) return val; // For averages, we handle total differently
+                   if (typeof val === 'number' && !Number.isInteger(val)) return val; 
                    total += val;
                    return val;
                 }).map((val, i) => `
@@ -1069,7 +1114,6 @@
             const totalPodiums = annualStats.reduce((acc, c) => acc + c.podiums, 0);
             const totalPRs = annualStats.reduce((acc, c) => acc + c.prs, 0);
             
-            // For Rates, "All Time" is calculated globally
             const ratePodiums = totalComps > 0 ? (totalPodiums / totalComps).toFixed(2) : "0.00";
             const ratePRs = totalComps > 0 ? (totalPRs / totalComps).toFixed(2) : "0.00";
             const rateSolves = totalComps > 0 ? (totalSolves / totalComps).toFixed(2) : "0.00";
@@ -1098,13 +1142,11 @@
         const LeaderboardView = () => {
              const { leaderboardData, isGeneratingLeaderboard, leaderboardProgress, leaderboardSort, selectedYear } = window.state;
              
-             // Sort Data
              let sortedData = [...leaderboardData];
              if (leaderboardSort) {
                  sortedData.sort((a, b) => b.stats[leaderboardSort] - a.stats[leaderboardSort]);
              }
              
-             // Generate Year Options
              const currentYear = new Date().getFullYear();
              const years = [];
              for(let y = currentYear; y >= 2000; y--) years.push(y);
@@ -1145,14 +1187,17 @@
                             <!-- Preset Column -->
                             <div class="space-y-3">
                                 <label class="text-sm font-medium text-slate-400">Preset: Top HK 3x3 Average</label>
-                                <div class="flex gap-2">
-                                    <select id="leaderboardLimitSelect" onchange="window.setState({ leaderboardLimit: parseInt(this.value) })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block w-full p-2.5">
+                                <div class="flex flex-wrap gap-2">
+                                    <select id="leaderboardLimitSelect" onchange="window.setState({ leaderboardLimit: parseInt(this.value) })" class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2.5">
                                         <option value="10" ${window.state.leaderboardLimit === 10 ? 'selected' : ''}>Top 10</option>
                                         <option value="20" ${window.state.leaderboardLimit === 20 ? 'selected' : ''}>Top 20</option>
                                         <option value="50" ${window.state.leaderboardLimit === 50 ? 'selected' : ''}>Top 50</option>
                                     </select>
-                                    <button onclick="fetchLeaderboard(false)" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
+                                    <button onclick="fetchLeaderboard('preset')" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
                                         Load Preset
+                                    </button>
+                                    <button onclick="fetchTop200()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap flex items-center gap-2">
+                                        <i data-lucide="list-plus" class="w-4 h-4"></i> Select from Top 200
                                     </button>
                                 </div>
                             </div>
@@ -1162,7 +1207,7 @@
                                 <label class="text-sm font-medium text-slate-400">Custom: Compare Specific WCA IDs</label>
                                 <div class="flex gap-2">
                                     <input type="text" id="customLeaderboardIds" placeholder="2017KWAN05, 2015LEON02..." class="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block w-full p-2.5">
-                                    <button onclick="fetchLeaderboard(true)" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
+                                    <button onclick="fetchLeaderboard('custom')" ${isGeneratingLeaderboard ? 'disabled' : ''} class="px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white text-sm font-bold rounded-lg transition-colors whitespace-nowrap">
                                         Compare IDs
                                     </button>
                                 </div>
@@ -1217,14 +1262,100 @@
                 </div>
              `;
         };
+        
+        // --- SELECTION MODAL ---
+        const Top200Modal = () => {
+            if (!window.state.showTop200Modal) return '';
+            
+            const { top200List, selectedTop200Ids, loadingTop200 } = window.state;
+            
+            const toggleSelection = (id) => {
+                const newSet = new Set(selectedTop200Ids);
+                if (newSet.has(id)) newSet.delete(id);
+                else {
+                    if (newSet.size >= 20) {
+                        alert("Please select max 20 cubers to avoid API rate limits.");
+                        return;
+                    }
+                    newSet.add(id);
+                }
+                window.setState({ selectedTop200Ids: newSet });
+            };
+            
+            return `
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+                    <div class="bg-slate-900 w-full max-w-2xl rounded-xl border border-slate-700 shadow-2xl flex flex-col max-h-[80vh]">
+                        <div class="p-4 border-b border-slate-800 flex justify-between items-center">
+                            <h3 class="text-lg font-bold text-white">Select from Top 200 (HK 3x3 Average)</h3>
+                            <button onclick="window.setState({ showTop200Modal: false })" class="text-slate-400 hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+                        </div>
+                        <div class="p-4 flex-1 overflow-y-auto no-scrollbar">
+                            ${loadingTop200 ? `
+                                <div class="flex flex-col items-center justify-center py-12 text-slate-500">
+                                    <i data-lucide="loader-2" class="animate-spin w-8 h-8 mb-2"></i>
+                                    Loading List...
+                                </div>
+                            ` : `
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                    ${top200List.map(p => {
+                                        const name = window.state.cachedNames[p.personId] || p.personName || p.name || p.personId;
+                                        return `
+                                        <div class="flex items-center p-2 rounded hover:bg-slate-800 cursor-pointer border border-transparent hover:border-slate-700" onclick="const cb = this.querySelector('input'); cb.click();">
+                                            <div class="checkbox-wrapper relative flex items-center mr-3">
+                                                <input type="checkbox" 
+                                                    class="peer appearance-none w-5 h-5 border border-slate-600 rounded bg-slate-800 checked:bg-indigo-600 checked:border-indigo-600 transition-colors cursor-pointer"
+                                                    ${selectedTop200Ids.has(p.personId) ? 'checked' : ''}
+                                                    onclick="event.stopPropagation(); window.toggleTop200Selection('${p.personId}')"
+                                                >
+                                                <i data-lucide="check" class="absolute w-3.5 h-3.5 text-white left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none opacity-0 peer-checked:opacity-100"></i>
+                                            </div>
+                                            <div>
+                                                <div class="text-sm font-medium text-white">${name}</div>
+                                                <div class="text-xs text-slate-500 font-mono flex gap-2">
+                                                    <span>${p.personId}</span>
+                                                    <span class="text-indigo-400 font-bold">${(p.best/100).toFixed(2)}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `; }).join('')}
+                                </div>
+                            `}
+                        </div>
+                        <div class="p-4 border-t border-slate-800 flex justify-between items-center bg-slate-900 rounded-b-xl">
+                            <span class="text-sm text-slate-400">${selectedTop200Ids.size} selected (Max 20)</span>
+                            <div class="flex gap-2">
+                                <button onclick="window.setState({ showTop200Modal: false })" class="px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-white">Cancel</button>
+                                <button onclick="window.setState({ showTop200Modal: false }); fetchLeaderboard('selection');" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-lg transition-colors shadow-lg shadow-indigo-500/20">
+                                    Generate Leaderboard
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+        
+        // Expose toggle function globally
+        window.toggleTop200Selection = (id) => {
+            const { selectedTop200Ids } = window.state;
+             const newSet = new Set(selectedTop200Ids);
+            if (newSet.has(id)) newSet.delete(id);
+            else {
+                if (newSet.size >= 20) {
+                    alert("Please select max 20 cubers to avoid API rate limits.");
+                    return;
+                }
+                newSet.add(id);
+            }
+            window.setState({ selectedTop200Ids: newSet });
+        };
 
-        // --- COMPETITION ITEM (UPDATED: FIXED WIDTH PR TAGS) ---
+        // --- COMPETITION ITEM ---
         const CompetitionItem = (comp, prCount, compPRs) => {
             const metadata = window.state.compMetadata[comp.id] || null;
             const compName = metadata?.name || comp.id;
             const link = `https://www.worldcubeassociation.org/competitions/${comp.id}`;
             
-            // Group results by event
             const eventsMap = new Map();
             comp.results.forEach(res => {
                 if (!eventsMap.has(res.event)) {
@@ -1234,7 +1365,6 @@
             });
 
             const eventResultsHtml = Array.from(eventsMap.entries())
-                // FILTER: Only keep events where a podium was achieved in a Final round
                 .filter(([event, rounds]) => {
                     return rounds.some(r => r.round.includes("Final") && r.place <= 3 && r.best > 0);
                 })
@@ -1277,15 +1407,12 @@
                         </div>`;
                 }).join('');
             
-            // Build PR List HTML with FIXED WIDTH
             let prsHtml = '';
             if (compPRs && compPRs.length > 0) {
-                 // Sort PRs by Event Order
                  compPRs.sort((a, b) => EVENT_ORDER.indexOf(a.eventId) - EVENT_ORDER.indexOf(b.eventId));
                  
                  const prList = compPRs.map(pr => {
                      const eInfo = getEventInfo(pr.eventId);
-                     // Added w-[180px] and justify-between for uniform length
                      return `<span class="inline-flex items-center justify-between px-2.5 py-1.5 bg-slate-800 rounded border border-slate-700 text-xs text-slate-300 shadow-sm w-[200px]">
                         <div class="flex items-center gap-1.5">
                             <div class="w-1.5 h-1.5 rounded-full ${eInfo.bg}"></div>
@@ -1435,14 +1562,12 @@
             const { userData, loading, error, historyData, selectedYear, activeTab, viewMode, compMetadata, loadingMetadata, selectedEvent } = window.state;
             const isAllTime = selectedYear === 'All Time';
             
-            // Calculate stats if we have data and are in profile mode
             let stats = null;
             let currentTotalMedals = 0;
             let prevTotalMedals = null;
             
             if (userData && historyData) {
                 stats = calculateStats(window.state);
-                // Trigger metadata fetch for display logic
                 if (!loading && !error && !window.state.metadataFetchInProgress) {
                     if (stats.statsComps.length > 0) {
                         const ids = stats.statsComps.map(c => c.id);
@@ -1480,7 +1605,10 @@
                 </header>
 
                 <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-                    ${viewMode === 'leaderboard' ? LeaderboardView() : `
+                    ${viewMode === 'leaderboard' ? `
+                        ${Top200Modal()}
+                        ${LeaderboardView()}
+                    ` : `
                         <!-- Profile View -->
                         ${loading ? `<div class="flex flex-col items-center justify-center py-20 text-indigo-400"><i data-lucide="loader-2" class="animate-spin mb-4 w-12 h-12"></i><p>Fetching WCA Data...</p></div>` 
                         : error ? `<div class="flex flex-col items-center justify-center py-20 text-red-400"><i data-lucide="alert-circle" class="mb-4 w-12 h-12"></i><p class="text-lg font-bold">Error Loading Data</p><p class="text-sm opacity-80">${error}</p><p class="text-xs mt-4 text-slate-500">Check WCA ID.</p></div>` 
@@ -1582,7 +1710,6 @@
                 searchForm.onsubmit = window.handleSearch;
             }
 
-            // Charts only render if we are in profile view and have stats
             if (viewMode === 'profile' && stats) {
                 if (activeTab === 'solves' && selectedEvent) {
                     setTimeout(() => renderSolvesChart(stats.statsComps, selectedEvent), 50);
@@ -1594,7 +1721,6 @@
             }
         };
 
-        // Add openProfile to window for global access from onclick attributes
         window.openProfile = (id) => {
             window.setState({ viewMode: 'profile', wcaId: id, selectedEvent: null });
             fetchData(id);
@@ -1603,7 +1729,6 @@
 
         window.addEventListener('load', () => {
             renderApp(); 
-            // Note: Replace WCA_ID_DEFAULT with your actual ID to see your data
             fetchData(window.state.wcaId);
         });
         
